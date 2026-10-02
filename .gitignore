@@ -1,0 +1,39 @@
+## Visual Studio / .NET
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+TestResults/
+BenchmarkDotNet.Artifacts/
+.nuget/
+packages/
+*.nupkg
+*.snupkg
+nuget.config
+
+# Rider
+.idea/
+*.sln.iml
+
+# dotnet tool manifest generated cache
+.config/dotnet-tools.json
+
+## Node / frontend
+node_modules/
+dist/
+.cache/
+
+# Env files — never commit secrets
+.env
+.env.local
+.env.*.local
+
+## OS
+.DS_Store
+Thumbs.db
+desktop.ini
