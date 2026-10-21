@@ -47,6 +47,8 @@ graph TD
     G --> J[MeterDataService HTTP client]
 ```
 
+The tokenizer (`src/EdifactEnergyParser.Core/Tokenizer.fs`) is itself an FParsec parser: it reads the optional UNA segment first and then builds the segment parser from those delimiters, so one pass turns raw text into a flat `Token` stream (`SegmentTag`, `DataElement`, `ComponentElement`, `SegmentTerminator`) with escapes already resolved.
+
 ---
 
 ## Quick Start
@@ -84,6 +86,9 @@ curl -X POST http://localhost:5001/api/messages/explain \
 | GeLi Gas | GeLi Gas | Geschäftsprozesse Lieferantenwechsel Gas — same for gas |
 | Anwendungshandbuch | Application handbook | BDEW specification for a specific EDIFACT message type |
 | Lieferantenwechsel | Supplier switch | Process by which a customer changes their energy supplier |
+| Trennzeichenvorgabe (UNA) | Service string advice | Optional first six characters that redefine the delimiters; ISO 9735 defaults `:+.? '` apply without it |
+| Freigabezeichen | Release character | Escape character (`?` by default) that makes the next delimiter literal, e.g. `?+` |
+| Datenelement / Gruppendatenelement | Data element / composite data element | Values separated by `+`; a composite is split further into components by `:` |
 
 ---
 
@@ -94,6 +99,7 @@ dotnet test
 ```
 
 Coverage highlights:
+- Tokenizer: UNA-present and UNA-absent input, custom delimiters, release-character escapes, empty elements, line breaks between segments, and error positions (line/column) for malformed input
 - Round-trip property tests (FsCheck): 10 000+ generated messages satisfy parse → serialize → parse identity
 - Escape character edge cases in segment data
 - All validation error paths return structured `ValidationError` with segment reference
