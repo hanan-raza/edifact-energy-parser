@@ -16,7 +16,8 @@ This project implements a typed EDIFACT parser in F# — chosen for its pattern-
 
 ## Features
 
-- F# EDIFACT tokenizer: UNA service string advice, UNB/UNH envelope, segments, composite elements, escape characters
+- F# EDIFACT tokenizer: UNA service string advice, segments, composite elements, escape characters
+- Envelope parser for UNB/UNH/UNT/UNZ with segment-count and reference checks, plus a writer for round-trips
 - Parser combinators with FParsec for typed MSCONS (meter readings) and UTILMD (supplier switch / master data) models
 - Validation rules as composable F# functions returning `Result<'T, ValidationError list>`
 - Round-trip guarantee: parse → model → serialize → parse produces identical models (FsCheck property tests)
@@ -48,6 +49,13 @@ graph TD
 ```
 
 The tokenizer (`src/EdifactEnergyParser.Core/Tokenizer.fs`) is itself an FParsec parser: it reads the optional UNA segment first and then builds the segment parser from those delimiters, so one pass turns raw text into a flat `Token` stream (`SegmentTag`, `DataElement`, `ComponentElement`, `SegmentTerminator`) with escapes already resolved.
+
+The envelope parser (`EnvelopeParser.fs`) works in three stages:
+1. **Grammar (FParsec)** — checks the nesting `UNB (UNH segment* UNT)+ UNZ` on top of the tokenizer's segment parser and records where each service segment starts. Body segments are kept untouched for the MSCONS/UTILMD parsers.
+2. **Typed conversion** — turns UNB/UNH/UNT/UNZ into an `InterchangeEnvelope` (sender, recipient, preparation time, control reference, message type, messages). A missing or malformed element becomes `InvalidElement` with line/column.
+3. **Consistency checks** — UNT segment counts, UNZ message count, repeated references, and one message type per interchange. All findings are returned together as `EnvelopeError list`, since a rejection should name every problem.
+
+UNB has no UTC offset, so the preparation time is read as local time in `Europe/Berlin` (or a zone passed to `parseIn`). A time in the repeated October hour counts as daylight time; a time in the skipped March hour is rejected. `EnvelopeWriter` serializes an envelope back to text and recomputes the trailer counts.
 
 ---
 
@@ -89,6 +97,10 @@ curl -X POST http://localhost:5001/api/messages/explain \
 | Trennzeichenvorgabe (UNA) | Service string advice | Optional first six characters that redefine the delimiters; ISO 9735 defaults `:+.? '` apply without it |
 | Freigabezeichen | Release character | Escape character (`?` by default) that makes the next delimiter literal, e.g. `?+` |
 | Datenelement / Gruppendatenelement | Data element / composite data element | Values separated by `+`; a composite is split further into components by `:` |
+| Übertragungsdatei (UNB…UNZ) | Interchange | One transmission between two market partners; UNZ repeats the UNB control reference and counts the messages |
+| Nachricht (UNH…UNT) | Message | One business document inside an interchange; UNT counts its segments, UNH and UNT included |
+| Datenaustauschreferenz | Interchange control reference | Sender-assigned ID of the interchange, used to match acknowledgements |
+| Marktpartner-ID | Market-partner ID | 13-digit code of a market participant (BDEW/DVGW code number or GS1 GLN), sent in UNB as sender/recipient |
 
 ---
 
@@ -100,6 +112,7 @@ dotnet test
 
 Coverage highlights:
 - Tokenizer: UNA-present and UNA-absent input, custom delimiters, release-character escapes, empty elements, line breaks between segments, and error positions (line/column) for malformed input
+- Envelope: typed UNB/UNH fields, text round-trip (parse → write), model round-trip with custom delimiters and escapes, segment/message count and reference mismatches (reported together), mixed message types, missing UNT/UNZ, and UNB times across both DST transitions (summer offset, repeated October hour, skipped March hour)
 - Round-trip property tests (FsCheck): 10 000+ generated messages satisfy parse → serialize → parse identity
 - Escape character edge cases in segment data
 - All validation error paths return structured `ValidationError` with segment reference

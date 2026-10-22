@@ -53,6 +53,25 @@ type TokenizedInterchange =
         Tokens: Token list
     }
 
+/// <summary>A segment (Segment) split into its data elements, each holding its components.</summary>
+type Segment =
+    {
+        /// <summary>The three-character segment tag (Segmentkennung), e.g. "UNB".</summary>
+        Tag: string
+        /// <summary>
+        /// Data elements in order; each is the list of its components (a simple data element has one).
+        /// Values are unescaped; omitted ones are "" so positions stay stable.
+        /// </summary>
+        Elements: string list list
+    }
+
+    /// <summary>The value at a 0-based data element and component position, or None if absent or empty.</summary>
+    member s.TryGet(element: int, ``component``: int) : string option =
+        s.Elements
+        |> List.tryItem element
+        |> Option.bind (List.tryItem ``component``)
+        |> Option.filter (fun v -> v <> "")
+
 /// <summary>A tokenizer failure with a 1-based position in the input.</summary>
 type TokenizeError =
     {
@@ -68,7 +87,7 @@ type TokenizeError =
 module Tokenizer =
     open FParsec
 
-    type private P<'T> = Parser<'T, unit>
+    type internal P<'T> = Parser<'T, unit>
 
     let private validate (d: Delimiters) : P<Delimiters> =
         // Decimal mark and reserved char may legitimately coincide with data characters,
@@ -105,27 +124,38 @@ module Tokenizer =
         let released = pchar d.ReleaseCharacter >>. (anyChar <?> "character after release character") |>> string
         manyStrings (plain <|> released)
 
-    let private segmentTag: P<Token> =
+    let private segmentTag: P<string> =
         manyMinMaxSatisfyL 3 3 (fun c -> isAsciiUpper c || isDigit c) "three-character segment tag"
-        |>> SegmentTag
 
-    let private dataElement (d: Delimiters) : P<Token list> =
-        pchar d.DataElementSeparator >>. value d .>>. many (pchar d.ComponentSeparator >>. value d)
-        |>> fun (first, components) -> DataElement first :: List.map ComponentElement components
+    let private dataElement (d: Delimiters) : P<string list> =
+        pchar d.DataElementSeparator >>. sepBy1 (value d) (pchar d.ComponentSeparator)
 
-    let private segment (d: Delimiters) : P<Token list> =
+    /// One segment including its terminator, read with the given delimiters.
+    let internal segment (d: Delimiters) : P<Segment> =
         pipe2 segmentTag (many (dataElement d) .>> pchar d.SegmentTerminator) (fun tag elements ->
-            tag :: List.concat elements @ [ SegmentTerminator ])
+            { Tag = tag; Elements = elements })
+
+    let private toTokens (s: Segment) : Token list =
+        let element =
+            function
+            | first :: components -> DataElement first :: List.map ComponentElement components
+            | [] -> []
+
+        SegmentTag s.Tag :: List.collect element s.Elements @ [ SegmentTerminator ]
 
     // Line breaks between segments are not part of the syntax but almost every real-world
     // file has them, so they are tolerated outside segments only.
-    let private lineBreaks: P<unit> = skipMany (anyOf "\r\n")
+    let internal lineBreaks: P<unit> = skipMany (anyOf "\r\n")
+
+    /// The optional UNA segment, falling back to the ISO 9735 defaults.
+    let internal delimiters: P<Delimiters> =
+        opt serviceStringAdvice |>> Option.defaultValue Delimiters.Default .>> lineBreaks
 
     let private interchange: P<TokenizedInterchange> =
-        opt serviceStringAdvice |>> Option.defaultValue Delimiters.Default .>> lineBreaks
+        delimiters
         >>= fun d ->
             many (segment d .>> lineBreaks) .>> eof
-            |>> fun segments -> { Delimiters = d; Tokens = List.concat segments }
+            |>> fun segments -> { Delimiters = d; Tokens = List.collect toTokens segments }
 
     /// <summary>
     /// Tokenizes an EDIFACT interchange. A leading UNA segment sets the delimiters;
