@@ -6,6 +6,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="Common.fs" />
     <Compile Include="Tokenizer.fs" />
     <Compile Include="EnvelopeParser.fs" />
     <Compile Include="EnvelopeWriter.fs" />

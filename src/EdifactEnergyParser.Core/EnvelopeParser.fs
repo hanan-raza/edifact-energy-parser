@@ -157,23 +157,7 @@ module EnvelopeParser =
             | Failure(message, error, _) ->
                 Result.Error(SyntaxError(message, error.Position.Line, error.Position.Column))
 
-    type private ResultBuilder() =
-        member _.Bind(r, f) = Result.bind f r
-        member _.Return v = Ok v
-        member _.ReturnFrom r = r
-
-    let private result = ResultBuilder()
-
-    let private traverse (f: 'a -> Result<'b, 'e>) (xs: 'a list) : Result<'b list, 'e> =
-        List.foldBack
-            (fun x acc ->
-                result {
-                    let! y = f x
-                    let! ys = acc
-                    return y :: ys
-                })
-            xs
-            (Ok [])
+    open Results
 
     // Stage 2: typed conversion of single segments.
     let private invalid (loc: Located) reason =
@@ -204,16 +188,10 @@ module EnvelopeParser =
                 }
         }
 
-    // UNB carries no UTC offset; it is the sender's local time. An ambiguous time in the repeated
-    // October hour is read as the first pass (daylight time); a time in the March gap cannot exist.
+    // UNB carries no UTC offset; it is the sender's local time.
     let private toOffset (zone: TimeZoneInfo) (loc: Located) (local: DateTime) =
-        if zone.IsInvalidTime local then
-            let text = local.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)
-            invalid loc $"Preparation time {text} does not exist in {zone.Id} (DST gap)"
-        elif zone.IsAmbiguousTime local then
-            Ok(DateTimeOffset(local, Array.max (zone.GetAmbiguousTimeOffsets local)))
-        else
-            Ok(DateTimeOffset(local, zone.GetUtcOffset local))
+        LocalTime.resolve zone local
+        |> Result.mapError (fun reason -> InvalidElement(loc.Segment.Tag, loc.Line, loc.Column, $"Preparation time {reason}"))
 
     let private prepared (zone: TimeZoneInfo) (loc: Located) =
         result {
