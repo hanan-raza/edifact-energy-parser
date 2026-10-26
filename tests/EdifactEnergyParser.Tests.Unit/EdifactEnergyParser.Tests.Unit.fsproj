@@ -9,7 +9,12 @@
   <ItemGroup>
     <Compile Include="TokenizerTests.fs" />
     <Compile Include="EnvelopeParserTests.fs" />
+    <Compile Include="MsconsParserTests.fs" />
     <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\docs\samples\*.edi" Link="samples\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
