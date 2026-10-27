@@ -10,6 +10,7 @@
     <Compile Include="TokenizerTests.fs" />
     <Compile Include="EnvelopeParserTests.fs" />
     <Compile Include="MsconsParserTests.fs" />
+    <Compile Include="UtilmdParserTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

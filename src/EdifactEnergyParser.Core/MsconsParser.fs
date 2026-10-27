@@ -103,9 +103,6 @@ type MsconsError =
 module MsconsParser =
     open Results
 
-    // Segment positions follow the APERAK convention: UNH is 1, so the first body segment is 2.
-    type private Located = { Segment: Segment; Position: int }
-
     type private RawValue = { Quantity: Located; Dates: Located list }
 
     type private RawSeries =
@@ -130,17 +127,10 @@ module MsconsParser =
             Points: RawPoint list
         }
 
-    // Stage 1: FParsec checks the segment order. FParsec reads characters, so the body is
-    // rendered one segment per line; the line number then gives the segment position.
+    // Stage 1: FParsec checks the segment order.
     module private Grammar =
         open FParsec
-
-        type private P<'T> = Parser<'T, unit>
-
-        let private seg (d: Delimiters) (tag: string) : P<Located> =
-            pipe2 getPosition (followedByString tag <?> $"{tag} segment" >>. Tokenizer.segment d) (fun pos s ->
-                { Segment = s; Position = int pos.Line + 1 })
-            .>> skipNewline
+        open SegmentGrammar
 
         // Contact details (SG4 CTA/COM) are allowed but not modelled.
         let private party d : P<Located> =
@@ -180,31 +170,9 @@ module MsconsParser =
                         Parties = parties
                         Points = points
                     })
-            .>> (eof <?> "end of message")
-
-        let private expected (error: ParserError) : string =
-            let labels =
-                ErrorMessageList.ToSortedArray error.Messages
-                |> Array.choose (function
-                    | :? ErrorMessage.Expected as e -> Some e.Label
-                    | _ -> None)
-
-            if labels.Length = 0 then "Unexpected segment" else "Expected " + String.Join(" or ", labels)
 
         let parse (d: Delimiters) (body: Segment list) : Result<RawMessage, int * string> =
-            let text =
-                body |> List.map (fun s -> EnvelopeWriter.writeSegment d s + "\n") |> String.concat ""
-
-            match run (message d) text with
-            | Success(raw, _, _) -> Result.Ok raw
-            | Failure(_, error, _) ->
-                let position = int error.Position.Line + 1
-
-                // Position past the body means the message ended early, i.e. UNT was found.
-                let found =
-                    body |> List.tryItem (position - 2) |> Option.map _.Tag |> Option.defaultValue "UNT"
-
-                Result.Error(position, $"{expected error}, found {found}")
+            SegmentGrammar.parse (message d) d body
 
     // Stage 2: typed conversion of the located segments.
     type private Context =
@@ -221,46 +189,15 @@ module MsconsParser =
         | Some v -> Ok v
         | None -> invalid ctx loc $"{name} is missing"
 
-    // Format 303 carries its own UTC offset ("+01"); 102 and 203 are local time in the market zone.
     let private dateTime ctx (loc: Located) : Result<string * DateTimeOffset, MsconsError> =
-        let parseExact (text: string) (pattern: string) : DateTime option =
-            match DateTime.TryParseExact(text, pattern, CultureInfo.InvariantCulture, DateTimeStyles.None) with
-            | true, local -> Some local
-            | _ -> None
-
-        let local text pattern =
-            match parseExact text pattern with
-            | Some value ->
-                LocalTime.resolve ctx.Zone value
-                |> Result.mapError (fun reason -> InvalidSegment(ctx.Reference, loc.Position, loc.Segment.Tag, reason))
-            | None -> invalid ctx loc $"Date/time '{text}' does not match its format"
-
-        let withOffset (text: string) =
-            let offset =
-                if text.Length = 15 && (text[12] = '+' || text[12] = '-') then
-                    match Int32.TryParse(text.Substring 13, NumberStyles.None, CultureInfo.InvariantCulture) with
-                    | true, hours when hours <= 14 ->
-                        let sign = if text[12] = '-' then -1.0 else 1.0
-                        Some(TimeSpan.FromHours(sign * float hours))
-                    | _ -> None
-                else
-                    None
-
-            match parseExact (text.Substring(0, min 12 text.Length)) "yyyyMMddHHmm", offset with
-            | Some value, Some offset -> Ok(DateTimeOffset(value, offset))
-            | _ -> invalid ctx loc $"Date/time '{text}' does not match format 303 (CCYYMMDDHHMMZZZ)"
-
         result {
             let! qualifier = required ctx loc (0, 0) "Date/time qualifier"
             let! text = required ctx loc (0, 1) "Date/time"
             let! format = required ctx loc (0, 2) "Date/time format"
 
             let! value =
-                match format with
-                | "102" -> local text "yyyyMMdd"
-                | "203" -> local text "yyyyMMddHHmm"
-                | "303" -> withOffset text
-                | other -> invalid ctx loc $"Date/time format '{other}' is not supported"
+                DateTimeFormat.parse ctx.Zone format text
+                |> Result.mapError (fun reason -> InvalidSegment(ctx.Reference, loc.Position, loc.Segment.Tag, reason))
 
             return qualifier, value
         }

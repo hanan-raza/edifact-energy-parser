@@ -10,7 +10,9 @@
     <Compile Include="Tokenizer.fs" />
     <Compile Include="EnvelopeParser.fs" />
     <Compile Include="EnvelopeWriter.fs" />
+    <Compile Include="SegmentGrammar.fs" />
     <Compile Include="MsconsParser.fs" />
+    <Compile Include="UtilmdParser.fs" />
   </ItemGroup>
 
   <ItemGroup>

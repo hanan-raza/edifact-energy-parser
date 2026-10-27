@@ -63,6 +63,12 @@ The MSCONS parser (`MsconsParser.fs`) takes the body segments of each message an
 
 Only the segments needed for interval values are modelled; anything else in the body is a `StructureError`, not silently ignored.
 
+The UTILMD parser (`UtilmdParser.fs`) uses the same two stages and shares the grammar runner (`SegmentGrammar.fs`) and DTM handling with MSCONS:
+1. **Grammar (FParsec)** — header `BGM`, `DTM`…, `NAD [CTA COM…]`…; then one or more transactions `IDE` → `DTM`… → `STS` → `LOC`… → (`SEQ` `CAV`…)… → `NAD`…. UTILMD has no `UNS`, so the header ends where the first `IDE` starts.
+2. **Typed conversion** — into `UtilmdMessage` → `SupplierSwitchTransaction` (transaction ID, `TransactionReason` from `STS+7`, start/end of supply from `DTM+92`/`DTM+93`, market location `LOC+Z16`, metering locations `LOC+Z17`) → `MasterDataRecord` (`SEQ` group with its `CAV` characteristics) and `TransactionParty` (`NAD`, e.g. the end customer `Z09` with name). Exactly one market location is required, and an end of supply must lie after the start.
+
+`UtilmdError` has the same cases as `MsconsError` but requires qualified access (`UtilmdError.StructureError`), so the two parsers can be opened side by side without their case names shadowing each other.
+
 ---
 
 ## Quick Start
@@ -111,6 +117,11 @@ curl -X POST http://localhost:5001/api/messages/explain \
 | Lastgang | Load profile | Series of interval values (usually 15 minutes) for one metering point and register |
 | OBIS-Kennzahl | OBIS code | Identifies the measured quantity, e.g. `1-1:1.29.0` consumption, `1-1:2.29.0` feed-in, per interval |
 | Wahrer Wert / Ersatzwert / Vorschlagswert | True / substitute / proposed value | Value status from the QTY qualifier (220 / 67 / 201): measured, formed by the metering operator, or suggested |
+| Marktlokation (MaLo) | Market location | Where energy is supplied and billed; 11-digit ID in UTILMD `LOC+Z16` |
+| Vorgang | Transaction | One business case inside a UTILMD message, opened by `IDE+24` with its own transaction ID |
+| Transaktionsgrund | Transaction reason | Why a transaction was sent (`STS+7`), e.g. supplier switch (Wechsel) or move in/out (Ein-/Auszug) |
+| Lieferbeginn / Lieferende | Start / end of supply | When the new supplier starts or stops supplying the market location (`DTM+92` / `DTM+93`) |
+| Endkunde | End customer | The consumer at the market location, named in `NAD+Z09` |
 
 ---
 
@@ -124,6 +135,7 @@ Coverage highlights:
 - Tokenizer: UNA-present and UNA-absent input, custom delimiters, release-character escapes, empty elements, line breaks between segments, and error positions (line/column) for malformed input
 - Envelope: typed UNB/UNH fields, text round-trip (parse → write), model round-trip with custom delimiters and escapes, segment/message count and reference mismatches (reported together), mixed message types, missing UNT/UNZ, and UNB times across both DST transitions (summer offset, repeated October hour, skipped March hour)
 - MSCONS: the 3-metering-point sample in `docs/samples/mscons_example.edi` (counts, exact `decimal` sums, OBIS codes, value statuses, contiguous intervals), a quarter hour across the October DST switch, local date format 102, decimal comma from UNA, optional PIA/RFF/CTA present and absent, and structure/element errors with their segment position
+- UTILMD: the 2-transaction sample in `docs/samples/utilmd_example.edi` (supplier switch and move-in, master data groups, end customer names), start of supply as format 303 and as local date 102 (winter and summer offset), a start in the March DST gap, missing STS / start of supply / market location, end before start, unsupported LOC qualifier, and MSCONS vs. UTILMD rejecting each other's messages
 - Round-trip property tests (FsCheck): 10 000+ generated messages satisfy parse → serialize → parse identity
 - Escape character edge cases in segment data
 - All validation error paths return structured `ValidationError` with segment reference
