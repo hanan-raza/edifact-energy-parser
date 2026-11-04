@@ -13,6 +13,7 @@
     <Compile Include="SegmentGrammar.fs" />
     <Compile Include="MsconsParser.fs" />
     <Compile Include="UtilmdParser.fs" />
+    <Compile Include="ValidationRules.fs" />
   </ItemGroup>
 
   <ItemGroup>

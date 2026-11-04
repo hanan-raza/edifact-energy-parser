@@ -19,7 +19,7 @@ This project implements a typed EDIFACT parser in F# — chosen for its pattern-
 - F# EDIFACT tokenizer: UNA service string advice, segments, composite elements, escape characters
 - Envelope parser for UNB/UNH/UNT/UNZ with segment-count and reference checks, plus a writer for round-trips
 - Parser combinators with FParsec for typed MSCONS (meter readings) and UTILMD (supplier switch / master data) models
-- Validation rules as composable F# functions returning `Result<'T, ValidationError list>`
+- Validation rules as composable F# functions (`MsconsMessage -> ValidationError list`) that gather every violation instead of failing fast
 - Round-trip guarantee: parse → model → serialize → parse produces identical models (FsCheck property tests)
 - C# ASP.NET Core API: receive → validate → state machine (Received → Validated → Processed/Rejected) → APERAK-style response
 - "Message explainer" endpoint: raw EDIFACT → human-readable JSON description of every segment
@@ -68,6 +68,15 @@ The UTILMD parser (`UtilmdParser.fs`) uses the same two stages and shares the gr
 2. **Typed conversion** — into `UtilmdMessage` → `SupplierSwitchTransaction` (transaction ID, `TransactionReason` from `STS+7`, start/end of supply from `DTM+92`/`DTM+93`, market location `LOC+Z16`, metering locations `LOC+Z17`) → `MasterDataRecord` (`SEQ` group with its `CAV` characteristics) and `TransactionParty` (`NAD`, e.g. the end customer `Z09` with name). Exactly one market location is required, and an end of supply must lie after the start.
 
 `UtilmdError` has the same cases as `MsconsError` but requires qualified access (`UtilmdError.StructureError`), so the two parsers can be opened side by side without their case names shadowing each other.
+
+Validation (`ValidationRules.fs`) runs after parsing and checks content that is well-formed but not acceptable. Each rule is a plain function `MsconsMessage -> ValidationError list`; `validateWith` combines a rule list with `List.collect`, so a rejection lists every problem at once (one `ValidationError` with segment tag and message per finding), and callers can pick their own rule set. `check` wraps the result as `Result<MsconsMessage, ValidationError list>`. The standard rules (`ValidationRules.all`):
+
+| Rule | Segment | Check |
+|------|---------|-------|
+| `senderIsMarketPartnerId` / `recipientIsMarketPartnerId` | NAD | 13 ASCII digits (ILN/GLN or BDEW code number); the check digit is not enforced |
+| `dateTimesInZone` | DTM | document date and every interval boundary carry the UTC offset `Europe/Berlin` has at that instant, e.g. `12:00+01` in July is rejected; both passes of the repeated October hour are accepted |
+| `quantitiesNotNegative` | QTY | no negative amounts; zero is a real reading (PV at night) and direction is carried by the OBIS code |
+| `hasMeteringPoint` | LOC | at least one metering point; the grammar already enforces it, but models built in code (API, generators) may not |
 
 ---
 
@@ -122,6 +131,8 @@ curl -X POST http://localhost:5001/api/messages/explain \
 | Transaktionsgrund | Transaction reason | Why a transaction was sent (`STS+7`), e.g. supplier switch (Wechsel) or move in/out (Ein-/Auszug) |
 | Lieferbeginn / Lieferende | Start / end of supply | When the new supplier starts or stops supplying the market location (`DTM+92` / `DTM+93`) |
 | Endkunde | End customer | The consumer at the market location, named in `NAD+Z09` |
+| ILN / GLN | Global location number | 13-digit GS1 number identifying a company; used, like BDEW code numbers, as market-partner ID |
+| Prüffehler | Validation error | A message that parses but breaks a business rule; reported back to the sender via APERAK |
 
 ---
 
@@ -138,7 +149,7 @@ Coverage highlights:
 - UTILMD: the 2-transaction sample in `docs/samples/utilmd_example.edi` (supplier switch and move-in, master data groups, end customer names), start of supply as format 303 and as local date 102 (winter and summer offset), a start in the March DST gap, missing STS / start of supply / market location, end before start, unsupported LOC qualifier, and MSCONS vs. UTILMD rejecting each other's messages
 - Round-trip property tests (FsCheck): 10 000+ generated messages satisfy parse → serialize → parse identity
 - Escape character edge cases in segment data
-- All validation error paths return structured `ValidationError` with segment reference
+- Validation: a valid message and the parsed sample (with a zero reading) return `[]`; a message with three violations returns exactly three `ValidationError`s; every violation of a rule is reported; non-13-digit and non-ASCII-digit party IDs; empty metering points; wrong offsets (summer time sent as `+01`, document date in UTC) and both DST transitions (repeated October hour, March switch); custom rule lists and a different zone
 - State machine: all valid and invalid transitions covered
 
 ---
