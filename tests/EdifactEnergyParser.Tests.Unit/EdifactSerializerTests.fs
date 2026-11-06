@@ -96,6 +96,60 @@ let ``decimal comma from UNA is used for quantities`` () =
     Assert.Contains("QTY+220:1,125:MWH'", written)
     Assert.Equal(message, parseSingle written)
 
+// FsCheck counterexample: +05:30 was written as "+05", moving the instant by 30 minutes.
+[<Fact>]
+let ``offset with minutes is written in UTC so the instant is kept`` () =
+    let start = DateTimeOffset(2021, 10, 22, 17, 59, 0, TimeSpan(5, 30, 0))
+    let message = oneValue start (start.AddMinutes 15.0) { Value = 1m; Unit = KilowattHour }
+
+    let written = EdifactSerializer.serialize message
+
+    Assert.Contains("DTM+163:202110221229?+00:303'", written)
+    Assert.Equal(message, parseSingle written)
+
+// FsCheck counterexample: a "\r" in the sender ID came back as "\n" (FParsec normalizes line breaks).
+[<Fact>]
+let ``control character in a value is refused instead of written`` () =
+    let message =
+        { oneValue (time (2026, 1, 15, 0, 0) 1.0) (time (2026, 1, 15, 0, 15) 1.0) { Value = 1m; Unit = KilowattHour } with
+            Sender = { Id = "\r"; CodeQualifier = None }
+        }
+
+    let error = Assert.Throws<ArgumentException>(fun () -> EdifactSerializer.serialize message |> ignore)
+
+    Assert.Contains("Sender ID", error.Message)
+    Assert.Contains("outside UNOC", error.Message)
+
+[<Fact>]
+let ``time with seconds and empty optional value are refused with every problem listed`` () =
+    let message =
+        oneValue (DateTimeOffset(2026, 1, 15, 0, 0, 30, TimeSpan.FromHours 1.0)) (time (2026, 1, 15, 0, 15) 1.0) { Value = 1m; Unit = KilowattHour }
+
+    let message =
+        { message with
+            MeteringPoints = [ { message.MeteringPoints.Head with MeterNumber = Some "" } ]
+        }
+
+    let error = Assert.Throws<ArgumentException>(fun () -> EdifactSerializer.serialize message |> ignore)
+
+    Assert.Contains("Meter number of DE0001234567800000000000000000001 is empty", error.Message)
+    Assert.Contains("has seconds", error.Message)
+
+[<Fact>]
+let ``message that breaks business rules still serializes`` () =
+    let valid =
+        oneValue (time (2026, 1, 15, 0, 0) 1.0) (time (2026, 1, 15, 0, 15) 1.0) { Value = -5m; Unit = KilowattHour }
+
+    let message =
+        { valid with
+            Sender = { Id = "123"; CodeQualifier = None }
+            DocumentDate = time (2026, 7, 1, 12, 0) 1.0
+        }
+
+    Assert.Equal(3, (ValidationRules.validate message).Length)
+    Assert.Equal(message, parseSingle (EdifactSerializer.serialize message))
+    Assert.Contains("UNH+", EdifactSerializer.serialize { message with MeteringPoints = [] })
+
 [<Fact>]
 let ``separators inside values are released`` () =
     let message =

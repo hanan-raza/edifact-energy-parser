@@ -14,6 +14,11 @@ module EdifactSerializer =
     // Format 303 (CCYYMMDDHHMMZZZ) keeps the sender's UTC offset, so no time zone is needed
     // to read the value back and both passes of the repeated October hour stay distinct.
     let private dateTime (qualifier: string) (value: DateTimeOffset) : Segment =
+        // ZZZ has whole hours only; an offset like +05:30 would silently move the instant by
+        // 30 minutes, so such values are written in UTC instead (same instant, offset +00).
+        let value =
+            if value.Offset.Ticks % TimeSpan.TicksPerHour = 0L then value else value.ToUniversalTime()
+
         let sign = if value.Offset < TimeSpan.Zero then "-" else "+"
         let hours = abs value.Offset.Hours
 
@@ -95,8 +100,64 @@ module EdifactSerializer =
         ]
         @ List.collect (meteringPoint d) m.MeteringPoints
 
-    /// <summary>The message with its UNH identifier (MSCONS D.04B, guide version 2.4c).</summary>
+    // Content EDIFACT cannot carry. Writing it anyway would produce text that parses to a
+    // different model, so it is refused instead. Business rules (ID formats, offsets, negative
+    // quantities, empty lists) are not checked here: an invalid message must still serialize.
+    let private unrepresentable (m: MsconsMessage) : string list =
+        let text name (value: string) =
+            [
+                if String.IsNullOrEmpty value then
+                    $"{name} is empty; EDIFACT cannot tell an empty value from an absent one"
+                // FParsec reads "\r" as "\n", and UNOC has no control characters anyway.
+                elif value |> String.exists (fun c -> Char.IsControl c || c > 'ÿ') then
+                    $"{name} '{value}' has characters outside UNOC (ISO 8859-1 without control characters)"
+            ]
+
+        let optionalText name value =
+            value |> Option.map (text name) |> Option.defaultValue []
+
+        let time name (value: DateTimeOffset) =
+            [
+                if value.Ticks % TimeSpan.TicksPerMinute <> 0L then
+                    let shown = value.ToString("o", CultureInfo.InvariantCulture)
+                    $"{name} {shown} has seconds; format 303 has minute precision"
+            ]
+
+        let party name (p: PartyIdentification) =
+            text $"{name} ID" p.Id @ optionalText $"{name} code list" p.CodeQualifier
+
+        [
+            yield! text "Message reference number" m.ReferenceNumber
+            yield! text "Document name code" m.DocumentType
+            yield! text "Document number" m.DocumentNumber
+            yield! time "Document date" m.DocumentDate
+            yield! party "Sender" m.Sender
+            yield! party "Recipient" m.Recipient
+
+            for p in m.MeteringPoints do
+                yield! text "Metering point ID" p.Id
+                yield! optionalText $"Meter number of {p.Id}" p.MeterNumber
+
+                for s in p.TimeSeries do
+                    yield! optionalText $"OBIS code of {p.Id}" s.ObisCode
+
+                    for v in s.Values do
+                        yield! time $"Interval start of {p.Id}" v.Start
+                        yield! time $"Interval end of {p.Id}" v.End
+        ]
+
+    /// <summary>
+    /// The message with its UNH identifier (MSCONS D.04B, guide version 2.4c).
+    /// </summary>
+    /// <exception cref="System.ArgumentException">
+    /// A value cannot be written so that it reads back unchanged: an empty text, a character
+    /// outside UNOC (e.g. a line break) or a time with seconds.
+    /// </exception>
     let msconsMessage (d: Delimiters) (m: MsconsMessage) : EdifactMessage =
+        match unrepresentable m with
+        | [] -> ()
+        | problems -> invalidArg (nameof m) (String.concat "; " problems)
+
         {
             ReferenceNumber = m.ReferenceNumber
             Identifier =
@@ -148,8 +209,10 @@ module EdifactSerializer =
     /// Serializes one message as a complete interchange with the given delimiters. The message
     /// reference number doubles as interchange control reference.
     /// </summary>
+    /// <exception cref="System.ArgumentException">The message holds a value EDIFACT cannot represent.</exception>
     let serializeWith (d: Delimiters) (m: MsconsMessage) : string =
         EnvelopeWriter.write (msconsInterchange d m.ReferenceNumber [ m ])
 
     /// <summary>Serializes one message as a complete interchange with the ISO 9735 default delimiters.</summary>
+    /// <exception cref="System.ArgumentException">The message holds a value EDIFACT cannot represent.</exception>
     let serialize (m: MsconsMessage) : string = serializeWith Delimiters.Default m

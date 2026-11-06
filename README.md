@@ -80,6 +80,8 @@ Validation (`ValidationRules.fs`) runs after parsing and checks content that is 
 
 The serializer (`EdifactSerializer.fs`) is the inverse of the MSCONS parser: `serialize` / `serializeWith delimiters` turn an `MsconsMessage` into a complete interchange (UNA, UNB `UNOC:3`, UNH `MSCONS:D:04B:UN:2.4c`, body, recomputed UNT/UNZ counts via `EnvelopeWriter`). Every date is written as format 303 with the value's own UTC offset, so both passes of the repeated October hour stay distinct and no time zone is needed to read them back. Quantities use the UNA decimal mark, separators inside values are released with `?`, and NAD code lists are mapped to their UNB counterparts (293 → 500 BDEW, 9 → 14 GS1, 332 → 502 DVGW). For the sample, the written message is byte-identical to the original from UNH to UNT.
 
+The serializer never writes text that would read back as a different model. An offset with minutes (e.g. `+05:30`, which format 303's whole-hour `ZZZ` cannot carry) is written in UTC, which keeps the instant. Values EDIFACT cannot represent are refused with one `ArgumentException` that lists every problem: empty texts (indistinguishable from an absent value), characters outside UNOC such as line breaks, and times with seconds. Business-rule violations (wrong ID format, wrong offset for Berlin, negative quantities, no metering points) are *not* refused, so a rejected message can still be written, e.g. for an error report.
+
 ---
 
 ## Quick Start
