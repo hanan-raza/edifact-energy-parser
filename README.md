@@ -41,7 +41,7 @@ graph TD
     B --> C[FParsec combinators F#]
     C --> D[Typed MSCONS / UTILMD model F#]
     D --> E[ValidationRules F#]
-    E --> F[WorkflowStateMachine C#]
+    E --> F[MessageWorkflow C#]
     F --> G[MessageController C# API]
     F --> H[AperakGenerator C#]
     D --> I[EdifactSerializer F#]
@@ -81,6 +81,23 @@ Validation (`ValidationRules.fs`) runs after parsing and checks content that is 
 The serializer (`EdifactSerializer.fs`) is the inverse of the MSCONS parser: `serialize` / `serializeWith delimiters` turn an `MsconsMessage` into a complete interchange (UNA, UNB `UNOC:3`, UNH `MSCONS:D:04B:UN:2.4c`, body, recomputed UNT/UNZ counts via `EnvelopeWriter`). Every date is written as format 303 with the value's own UTC offset, so both passes of the repeated October hour stay distinct and no time zone is needed to read them back. Quantities use the UNA decimal mark, separators inside values are released with `?`, and NAD code lists are mapped to their UNB counterparts (293 → 500 BDEW, 9 → 14 GS1, 332 → 502 DVGW). For the sample, the written message is byte-identical to the original from UNH to UNT.
 
 The serializer never writes text that would read back as a different model. An offset with minutes (e.g. `+05:30`, which format 303's whole-hour `ZZZ` cannot carry) is written in UTC, which keeps the instant. Values EDIFACT cannot represent are refused with one `ArgumentException` that lists every problem: empty texts (indistinguishable from an absent value), characters outside UNOC such as line breaks, and times with seconds. Business-rule violations (wrong ID format, wrong offset for Berlin, negative quantities, no metering points) are *not* refused, so a rejected message can still be written, e.g. for an error report.
+
+The C# workflow (`src/EdifactEnergyParser.Workflow`) tracks each incoming message through a small state machine:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Received
+    Received --> Validated: parsed, all rules pass
+    Received --> Rejected: parse or validation errors
+    Validated --> Processed: business process took over
+    Validated --> Rejected: processing failed
+    Processed --> [*]
+    Rejected --> [*]
+```
+
+The allowed transitions live in one table (`MessageTransitions`); `MessageWorkflow` exposes `Receive`, `MarkValidated`, `MarkProcessed` and `Reject` and throws `InvalidOperationException` for anything else, e.g. processing a message that was never validated or touching a message that is already final. A correction from the sender is a new message, never a reopened one. The workflow does no parsing itself: the caller reports the outcome, so the class has no F# dependency. A rejection needs at least one `MessageError` (segment + text, the same shape as the F# `ValidationError`), because a negative APERAK without a reason gives the sender nothing to fix.
+
+Each `TrackedMessage` is an immutable record with the raw text, current state, errors, a `Version` and a UTC history of every step. `InMemoryMessageStore` keeps them in a `ConcurrentDictionary` and replaces a message only if the stored snapshot is still the one the transition was based on (compare-and-swap via `TryUpdate`). If two requests race, the loser re-reads, sees the new state and fails the transition rule instead of overwriting the winner. `IMessageStore` is the seam for a database-backed store later.
 
 ---
 
@@ -158,7 +175,7 @@ Coverage highlights:
   - Hand-written shrinkers drop list items, shorten texts and reset values, so a failure is reported as a one-value message. The first runs found two bugs: a `+05:30` offset written as `+05` (instant moved 30 minutes) and a `\r` in a party ID read back as `\n` (FParsec newline normalization); both are fixed and kept as unit tests
 - Escape character edge cases in segment data
 - Validation: a valid message and the parsed sample (with a zero reading) return `[]`; a message with three violations returns exactly three `ValidationError`s; every violation of a rule is reported; non-13-digit and non-ASCII-digit party IDs; empty metering points; wrong offsets (summer time sent as `+01`, document date in UTC) and both DST transitions (repeated October hour, March switch); custom rule lists and a different zone
-- State machine: all valid and invalid transitions covered
+- Workflow state machine (C#, `tests/EdifactEnergyParser.Tests.Workflow`, xUnit + Shouldly): the transition table for all 16 state pairs, every valid transition and every forbidden one reachable through a method (message left unchanged), the accepted path Received → Validated → Processed and both rejection paths with errors and a timestamped history (`FakeTimeProvider`), rejection without errors, unknown IDs, and 16 threads racing to process/reject one message (exactly one wins). The in-memory store refuses duplicate IDs and stale snapshots
 
 ---
 
