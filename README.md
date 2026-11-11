@@ -99,6 +99,39 @@ The allowed transitions live in one table (`MessageTransitions`); `MessageWorkfl
 
 Each `TrackedMessage` is an immutable record with the raw text, current state, errors, a `Version` and a UTC history of every step. `InMemoryMessageStore` keeps them in a `ConcurrentDictionary` and replaces a message only if the stored snapshot is still the one the transition was based on (compare-and-swap via `TryUpdate`). If two requests race, the loser re-reads, sees the new state and fails the transition rule instead of overwriting the winner. `IMessageStore` is the seam for a database-backed store later.
 
+`AperakGenerator` (C#, same project) writes the response to the sender as a complete EDIFACT interchange: `Accept` for an accepted message, `Reject` with one `ERC` code and `FTX` text per `MessageError`, or `For(trackedMessage, …)` to choose from the workflow state (a message still in `Received` has no outcome yet and is refused). The caller passes a `ReceivedInterchange` (original control reference, message reference, sender, recipient: four plain values the API copies out of the F# envelope) and a control reference for the response. A rejected MSCONS, answered on 1 July 2025 at 10:15 German time:
+
+```
+UNA:+.? '
+UNB+UNOC:3+4012345000023:14+9900000000003:500+250701:1015+APK0001'
+UNH+1+APERAK:D:07B:UN'
+BGM+313+APK0001'
+DTM+137:202507011015?+02:303'
+RFF+ACW:MSC20251026'
+RFF+ACE:MSG0042'
+NAD+MS+4012345000023::9'
+NAD+MR+9900000000003::293'
+ERC+E20'
+FTX+AAO+++QTY?: Quantity -1 is negative.'
+UNT+10+1'
+UNZ+1+APK0001'
+```
+
+- Sender and recipient swap; `RFF+ACW` carries the original interchange control reference, which is what the sender uses to match the answer, and `RFF+ACE` the original message reference.
+- `BGM` 312 = acknowledgement, 313 = application error (UNCL 1001). The `ERC` codes are project-specific and deliberately coarse; the `FTX` text (prefixed with the segment tag) says what is wrong:
+
+  | Code | Meaning |
+  |------|---------|
+  | `A00` | Accepted |
+  | `E10` | Envelope or syntax problem (error on UNA/UNB/UNH/UNT/UNZ) |
+  | `E20` | Business-rule violation in the message content |
+
+- The document date is German local time with its UTC offset (format 303), so the two passes of the repeated October hour stay distinct.
+- Delimiters in error texts are released with `?`. Line breaks become spaces and characters outside Latin-1 (UNOC) become `?`, because a reader would otherwise get a different text than we sent. Texts longer than `FTX` allows (5 × 512 characters) are split and then cut.
+- One segment per line, which the tokenizer tolerates and which reads well in a log.
+
+This is APERAK-*style*: segment choice and qualifiers follow UN/EDIFACT, but it does not implement any market-specific application handbook.
+
 ---
 
 ## Quick Start
@@ -153,6 +186,8 @@ curl -X POST http://localhost:5001/api/messages/explain \
 | Lieferbeginn / Lieferende | Start / end of supply | When the new supplier starts or stops supplying the market location (`DTM+92` / `DTM+93`) |
 | Endkunde | End customer | The consumer at the market location, named in `NAD+Z09` |
 | ILN / GLN | Global location number | 13-digit GS1 number identifying a company; used, like BDEW code numbers, as market-partner ID |
+| Bestätigung / Ablehnung | Acknowledgement / rejection | The two outcomes an APERAK reports back for a received message |
+| Bezugsnachricht | Referenced message | The original message an APERAK answers, identified by its interchange control reference (`RFF+ACW`) |
 | Prüffehler | Validation error | A message that parses but breaks a business rule; reported back to the sender via APERAK |
 
 ---
@@ -176,6 +211,7 @@ Coverage highlights:
 - Escape character edge cases in segment data
 - Validation: a valid message and the parsed sample (with a zero reading) return `[]`; a message with three violations returns exactly three `ValidationError`s; every violation of a rule is reported; non-13-digit and non-ASCII-digit party IDs; empty metering points; wrong offsets (summer time sent as `+01`, document date in UTC) and both DST transitions (repeated October hour, March switch); custom rule lists and a different zone
 - Workflow state machine (C#, `tests/EdifactEnergyParser.Tests.Workflow`, xUnit + Shouldly): the transition table for all 16 state pairs, every valid transition and every forbidden one reachable through a method (message left unchanged), the accepted path Received → Validated → Processed and both rejection paths with errors and a timestamped history (`FakeTimeProvider`), rejection without errors, unknown IDs, and 16 threads racing to process/reject one message (exactly one wins). The in-memory store refuses duplicate IDs and stale snapshots
+- APERAK generator (same C# test project, which references the F# core only to read responses back): every response is tokenized and parsed by `EnvelopeParser`, so syntax, UNT segment count and UNZ control reference are checked. A rejection names the original control number and every error (code + text, in order); an acceptance carries `BGM` 312 and `ERC+A00`; released delimiters read back unchanged; line breaks, `€` and over-long texts; partners with and without code list; the document date in winter, summer, both passes of the repeated October hour and after the March switch; refusal of rejections without errors and of empty/over-long references; and the response chosen from the workflow state
 
 ---
 
