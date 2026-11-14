@@ -132,6 +132,42 @@ UNZ+1+APK0001'
 
 This is APERAK-*style*: segment choice and qualifiers follow UN/EDIFACT, but it does not implement any market-specific application handbook.
 
+The API (`src/EdifactEnergyParser.Api`) ties the pieces together:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant MC as MessageController
+    participant W as MessageWorkflow
+    participant A as MsconsAdapter
+    participant F as EdifactEnergyParser.Core
+    C->>MC: POST /api/messages (text/plain)
+    MC->>W: Receive(content)
+    W-->>MC: TrackedMessage (Received)
+    MC->>A: Check(content)
+    A->>F: EnvelopeParser.parse, MsconsParser.parseMessageIn, ValidationRules.validate
+    F-->>A: Result / ValidationError list
+    A-->>MC: MsconsCheckResult (MessageError list)
+    alt no errors
+        MC->>W: MarkValidated(id)
+        MC-->>C: 200 { id, state: "Validated", errors: [], history }
+    else errors
+        MC->>W: Reject(id, errors)
+        MC-->>C: 422 { id, state: "Rejected", errors: [...], history }
+    end
+```
+
+| Endpoint | Body | Responses |
+|----------|------|-----------|
+| `POST /api/messages` | raw EDIFACT, `Content-Type: text/plain` (UTF-8, or `charset=iso-8859-1` for UNOC files) | `200` validated · `422` rejected, with every error · `400` empty body or bytes that are not valid UTF-8 · `415` not `text/plain` |
+| `GET /api/messages/{id}` | – | `200` current state, errors and history · `404` unknown ID (problem details) |
+
+- **Adapter, not DI into F#.** `MsconsAdapter` is the only C# class that calls the F# modules. They stay plain functions; the adapter translates `Result`, F# lists and the error unions (`EnvelopeError`, `MsconsError`) into `MessageError(segment, text)`. Structure errors get the tag of the segment where parsing stopped; syntax errors keep line, column and FParsec's "Expecting: …" but drop its caret drawing. Validation errors are prefixed with the message reference (`Message 1: …`). The adapter also copies the four UNB/UNH values an APERAK needs into a `ReceivedInterchange`.
+- **Store first, then check.** A message is stored as `Received` before parsing, so every message, even unreadable text, gets an ID and a history. Envelope, structure and rule errors all end in `Rejected` (422); only an empty body is a client error (400) with nothing stored.
+- **Validated, not yet Processed.** Handing values to meter-data-service is the processing step; until it exists the API stops at `Validated`.
+- **text/plain input.** `PlainTextInputFormatter` reads the body as UTF-8 or as Latin-1 when the client declares it. Latin-1 bytes sent without a charset are refused with a hint instead of being decoded into replacement characters.
+- States are serialized as names (`"Rejected"`), and the store is an in-memory singleton: messages are lost on restart.
+
 ---
 
 ## Quick Start
@@ -140,18 +176,22 @@ This is APERAK-*style*: segment choice and qualifiers follow UN/EDIFACT, but it 
 dotnet run --project src/EdifactEnergyParser.Api
 ```
 
-Parse a MSCONS message:
+Receive, parse and validate an MSCONS message (200 with `"state": "Validated"`, or 422 with the error list):
 
 ```bash
-curl -X POST http://localhost:5001/api/messages \
+curl -X POST http://localhost:5166/api/messages \
   -H "Content-Type: text/plain" \
   --data-binary @docs/samples/mscons_example.edi
+
+curl http://localhost:5166/api/messages/<id from the response>
 ```
 
-Explain a message:
+`src/EdifactEnergyParser.Api/EdifactEnergyParser.Api.http` has the same requests plus a rejected message and an unknown ID.
+
+Explain a message (planned):
 
 ```bash
-curl -X POST http://localhost:5001/api/messages/explain \
+curl -X POST http://localhost:5166/api/messages/explain \
   -H "Content-Type: text/plain" \
   --data-binary @docs/samples/mscons_example.edi
 ```
@@ -212,6 +252,7 @@ Coverage highlights:
 - Validation: a valid message and the parsed sample (with a zero reading) return `[]`; a message with three violations returns exactly three `ValidationError`s; every violation of a rule is reported; non-13-digit and non-ASCII-digit party IDs; empty metering points; wrong offsets (summer time sent as `+01`, document date in UTC) and both DST transitions (repeated October hour, March switch); custom rule lists and a different zone
 - Workflow state machine (C#, `tests/EdifactEnergyParser.Tests.Workflow`, xUnit + Shouldly): the transition table for all 16 state pairs, every valid transition and every forbidden one reachable through a method (message left unchanged), the accepted path Received → Validated → Processed and both rejection paths with errors and a timestamped history (`FakeTimeProvider`), rejection without errors, unknown IDs, and 16 threads racing to process/reject one message (exactly one wins). The in-memory store refuses duplicate IDs and stale snapshots
 - APERAK generator (same C# test project, which references the F# core only to read responses back): every response is tokenized and parsed by `EnvelopeParser`, so syntax, UNT segment count and UNZ control reference are checked. A rejection names the original control number and every error (code + text, in order); an acceptance carries `BGM` 312 and `ERC+A00`; released delimiters read back unchanged; line breaks, `€` and over-long texts; partners with and without code list; the document date in winter, summer, both passes of the repeated October hour and after the March switch; refusal of rejections without errors and of empty/over-long references; and the response chosen from the workflow state
+- API end to end (`tests/EdifactEnergyParser.Tests.Integration`, `WebApplicationFactory` + a synthetic MSCONS builder): a valid message is `Validated` (200) and can be fetched again; rule violations, a broken UNT count and non-EDIFACT text are `Rejected` (422) with every error and stay stored; states are serialized as names; a Latin-1 body with `charset=iso-8859-1` is accepted and without a charset is a 400 with a hint; empty and whitespace bodies are 400, JSON is 415, unknown and non-GUID IDs are 404. Adapter tests cover the docs sample, the UNB references copied for APERAK, envelope/syntax/structure/wrong-type errors and the segment tag each one names
 
 ---
 
