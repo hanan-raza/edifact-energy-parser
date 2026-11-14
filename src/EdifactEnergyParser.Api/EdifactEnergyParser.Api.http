@@ -1,6 +1,37 @@
-@EdifactEnergyParser.Api_HostAddress = http://localhost:5166
+@host = http://localhost:5166
 
-GET {{EdifactEnergyParser.Api_HostAddress}}/weatherforecast/
+### Receive the sample MSCONS (expects 200, state "Validated")
+# @name receive
+POST {{host}}/api/messages
+Content-Type: text/plain
+
+< ../../docs/samples/mscons_example.edi
+
+### Look up the message just received
+GET {{host}}/api/messages/{{receive.response.body.$.id}}
 Accept: application/json
 
-###
+### Rejected message: sender is not a 13-digit market-partner ID (expects 422 with error list)
+POST {{host}}/api/messages
+Content-Type: text/plain
+
+UNA:+.? '
+UNB+UNOC:3+9900000000003:500+9900000000010:500+260116:0630+TST0000002'
+UNH+1+MSCONS:D:04B:UN:2.4c'
+BGM+7+MSI0000002+9'
+DTM+137:202601160630?+01:303'
+NAD+MS+12345::293'
+NAD+MR+9900000000010::293'
+UNS+D'
+NAD+DP'
+LOC+172+DE0001234567800000000000000000001'
+LIN+1'
+QTY+220:-0.250:KWH'
+DTM+163:202601150000?+01:303'
+DTM+164:202601150015?+01:303'
+UNT+13+1'
+UNZ+1+TST0000002'
+
+### Unknown ID (expects 404)
+GET {{host}}/api/messages/00000000-0000-0000-0000-000000000000
+Accept: application/json
