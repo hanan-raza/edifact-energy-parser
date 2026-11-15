@@ -29,7 +29,7 @@ This project implements a typed EDIFACT parser in F# — chosen for its pattern-
 
 ## Innovation
 
-_TODO: expand after implementation_
+**Message explainer.** EDIFACT is hard to read for anyone who does not work with it every day: `QTY+67:0.205:KWH` or `NAD+MS+9900000000003::293` mean nothing without the code lists. `POST /api/messages/explain` takes raw EDIFACT and returns every segment as JSON with a description and the meaning of each value: code texts (`67` → substitute value), dates with their UTC offset, market-partner IDs with their code list, OBIS codes, and the UNT/UNZ counts *declared vs. counted*. It only needs text that can be split into segments, so a message the API rejected can be explained to find out why. Support staff and developers can read a message without a handbook open next to them.
 
 ---
 
@@ -161,12 +161,19 @@ sequenceDiagram
 |----------|------|-----------|
 | `POST /api/messages` | raw EDIFACT, `Content-Type: text/plain` (UTF-8, or `charset=iso-8859-1` for UNOC files) | `200` validated · `422` rejected, with every error · `400` empty body or bytes that are not valid UTF-8 · `415` not `text/plain` |
 | `GET /api/messages/{id}` | – | `200` current state, errors and history · `404` unknown ID (problem details) |
+| `POST /api/messages/explain` | raw EDIFACT, `Content-Type: text/plain` | `200` JSON array `{ segment, description, fields: [{ name, value, meaning }] }` · `422` text cannot be split into segments (problem details with line/column) · `400` empty body · `415` not `text/plain` |
 
-- **Adapter, not DI into F#.** `MsconsAdapter` is the only C# class that calls the F# modules. They stay plain functions; the adapter translates `Result`, F# lists and the error unions (`EnvelopeError`, `MsconsError`) into `MessageError(segment, text)`. Structure errors get the tag of the segment where parsing stopped; syntax errors keep line, column and FParsec's "Expecting: …" but drop its caret drawing. Validation errors are prefixed with the message reference (`Message 1: …`). The adapter also copies the four UNB/UNH values an APERAK needs into a `ReceivedInterchange`.
+- **Adapter, not DI into F#.** `MsconsAdapter` and `ExplainerAdapter` are the only C# classes that call the F# modules. They stay plain functions; the adapter translates `Result`, F# lists and the error unions (`EnvelopeError`, `MsconsError`) into `MessageError(segment, text)`. Structure errors get the tag of the segment where parsing stopped; syntax errors keep line, column and FParsec's "Expecting: …" but drop its caret drawing. Validation errors are prefixed with the message reference (`Message 1: …`). The adapter also copies the four UNB/UNH values an APERAK needs into a `ReceivedInterchange`.
 - **Store first, then check.** A message is stored as `Received` before parsing, so every message, even unreadable text, gets an ID and a history. Envelope, structure and rule errors all end in `Rejected` (422); only an empty body is a client error (400) with nothing stored.
 - **Validated, not yet Processed.** Handing values to meter-data-service is the processing step; until it exists the API stops at `Validated`.
 - **text/plain input.** `PlainTextInputFormatter` reads the body as UTF-8 or as Latin-1 when the client declares it. Latin-1 bytes sent without a charset are refused with a hint instead of being decoded into replacement characters.
 - States are serialized as names (`"Rejected"`), and the store is an in-memory singleton: messages are lost on restart.
+
+The message explainer (`SegmentExplainer.fs`) is a lookup table in F#: segment tag → description plus, per data element and component position, a name and a function that explains the value. Most functions are code-list lookups; some read the rest of the segment (a `DTM` value is parsed with its format code and shown with its UTC offset, a `QTY` amount gets the unit from the same segment, a `LOC` ID is checked for 33 characters or 11 digits depending on the qualifier) or a running count (`UNT`/`UNZ` show declared and counted segments/messages). It covers every segment the MSCONS, UTILMD and APERAK code reads or writes: `UNA UNB UNH BGM DTM NAD CTA COM UNS LOC RFF LIN PIA QTY IDE STS SEQ CAV ERC FTX UNT UNZ`.
+- It runs on `Tokenizer.segments`, not on the typed parsers, so fragments, unknown segments and messages the parsers reject are explained too. Nothing is stored.
+- Every non-empty value is listed. A value the table does not know still gets a meaning, which says so (`Quantity qualifier '999' is not in the explainer's code list`, `Data element 3, component 1: Not interpreted by the explainer`), so `meaning` is never `null`.
+- Qualified segments (`DTM`, `NAD`, `LOC`, `QTY`, …) carry the qualifier's meaning in their description, e.g. `Date/time/period (Datum/Uhrzeit/Zeitspanne): Interval start (Beginn des Messzeitraums), inclusive`.
+- The code texts are written for this project from public UN/EDIFACT code lists; market-specific codes (e.g. `Z15` standard load profile in `CAV`) cover what the samples use and are not a complete application handbook.
 
 ---
 
@@ -188,12 +195,41 @@ curl http://localhost:5166/api/messages/<id from the response>
 
 `src/EdifactEnergyParser.Api/EdifactEnergyParser.Api.http` has the same requests plus a rejected message and an unknown ID.
 
-Explain a message (planned):
+Explain a message segment by segment:
 
 ```bash
 curl -X POST http://localhost:5166/api/messages/explain \
   -H "Content-Type: text/plain" \
   --data-binary @docs/samples/mscons_example.edi
+```
+
+Excerpt of the response (UNB and the substitute value in the sample):
+
+```json
+[
+  {
+    "segment": "UNB",
+    "description": "Interchange header (Nutzdaten-Kopfsegment): opens the transmission and names sender and recipient",
+    "fields": [
+      { "name": "Syntax identifier", "value": "UNOC", "meaning": "Character set C: Latin-1 (ISO 8859-1), required in the German energy market" },
+      { "name": "Syntax version", "value": "3", "meaning": "ISO 9735 version 3" },
+      { "name": "Sender identification", "value": "9900000000003", "meaning": "Market-partner ID (Marktpartner-ID) of the sender, e.g. a GLN/ILN or BDEW code number" },
+      { "name": "Sender code list", "value": "500", "meaning": "BDEW: the ID is a BDEW code number (BDEW-Codenummer) for electricity" },
+      …
+    ]
+  },
+  …
+  {
+    "segment": "QTY",
+    "description": "Quantity (Mengenangabe): Substitute value (Ersatzwert): formed by the metering operator for a missing or implausible reading",
+    "fields": [
+      { "name": "Quantity qualifier", "value": "67", "meaning": "Substitute value (Ersatzwert): formed by the metering operator for a missing or implausible reading" },
+      { "name": "Quantity", "value": "0.205", "meaning": "Metered amount 0.205 kWh" },
+      { "name": "Measurement unit", "value": "KWH", "meaning": "Kilowatt hour: energy" }
+    ]
+  },
+  …
+]
 ```
 
 ---
@@ -253,6 +289,7 @@ Coverage highlights:
 - Workflow state machine (C#, `tests/EdifactEnergyParser.Tests.Workflow`, xUnit + Shouldly): the transition table for all 16 state pairs, every valid transition and every forbidden one reachable through a method (message left unchanged), the accepted path Received → Validated → Processed and both rejection paths with errors and a timestamped history (`FakeTimeProvider`), rejection without errors, unknown IDs, and 16 threads racing to process/reject one message (exactly one wins). The in-memory store refuses duplicate IDs and stale snapshots
 - APERAK generator (same C# test project, which references the F# core only to read responses back): every response is tokenized and parsed by `EnvelopeParser`, so syntax, UNT segment count and UNZ control reference are checked. A rejection names the original control number and every error (code + text, in order); an acceptance carries `BGM` 312 and `ERC+A00`; released delimiters read back unchanged; line breaks, `€` and over-long texts; partners with and without code list; the document date in winter, summer, both passes of the repeated October hour and after the March switch; refusal of rejections without errors and of empty/over-long references; and the response chosen from the workflow state
 - API end to end (`tests/EdifactEnergyParser.Tests.Integration`, `WebApplicationFactory` + a synthetic MSCONS builder): a valid message is `Validated` (200) and can be fetched again; rule violations, a broken UNT count and non-EDIFACT text are `Rejected` (422) with every error and stay stored; states are serialized as names; a Latin-1 body with `charset=iso-8859-1` is accepted and without a charset is a 400 with a hint; empty and whitespace bodies are 400, JSON is 415, unknown and non-GUID IDs are 404. Adapter tests cover the docs sample, the UNB references copied for APERAK, envelope/syntax/structure/wrong-type errors and the segment tag each one names
+- Message explainer (F# unit tests + API end to end): every segment and value of the MSCONS and UTILMD samples and of an APERAK gets a specific meaning (no "not interpreted", unknown code or `null`); UNB names sender and recipient ILN with their code lists; DTM 303 keeps the sent offset, DTM 102 in July is shown as `UTC+02:00`, a time in the March DST gap is explained as unreadable instead of failing; released delimiters are shown unescaped; UNT/UNZ show declared vs. counted values; wrong-length metering point IDs, unknown segments/codes, custom UNA delimiters and text that is not EDIFACT (422 with line/column). A message the receive endpoint rejects is still explained (200)
 
 ---
 

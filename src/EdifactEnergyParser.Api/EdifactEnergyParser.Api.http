@@ -32,6 +32,24 @@ DTM+164:202601150015?+01:303'
 UNT+13+1'
 UNZ+1+TST0000002'
 
+### Explain the sample MSCONS segment by segment (expects 200 with a JSON array)
+POST {{host}}/api/messages/explain
+Content-Type: text/plain
+
+< ../../docs/samples/mscons_example.edi
+
+### Explain the sample UTILMD (any tokenizable EDIFACT works, not only MSCONS)
+POST {{host}}/api/messages/explain
+Content-Type: text/plain
+
+< ../../docs/samples/utilmd_example.edi
+
+### Explain text that is not EDIFACT (expects 422 with line and column)
+POST {{host}}/api/messages/explain
+Content-Type: text/plain
+
+hello world
+
 ### Unknown ID (expects 404)
 GET {{host}}/api/messages/00000000-0000-0000-0000-000000000000
 Accept: application/json
