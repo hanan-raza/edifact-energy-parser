@@ -17,7 +17,7 @@ public sealed record MsconsCheckResult(
 }
 
 /// <summary>
-/// The only place where C# calls the F# core: runs <see cref="EnvelopeParser"/>, <see cref="MsconsParser"/>
+/// Together with <see cref="ExplainerAdapter"/> the only place where C# calls the F# core: runs <see cref="EnvelopeParser"/>, <see cref="MsconsParser"/>
 /// and <see cref="ValidationRules"/> and translates their F# unions into <see cref="MessageError"/>s.
 /// </summary>
 /// <remarks>
@@ -76,7 +76,7 @@ public sealed class MsconsAdapter
     // generator reports it as an envelope error.
     private static MessageError FromEnvelope(EnvelopeError error) => error switch
     {
-        EnvelopeError.SyntaxError e => new("", $"Syntax error at line {e.line}, column {e.column}: {Expectation(e.message)}"),
+        EnvelopeError.SyntaxError e => new("", $"Syntax error at line {e.line}, column {e.column}: {FParsecMessage.Expectation(e.message)}"),
         EnvelopeError.InvalidElement e => new(e.segment, $"{e.reason} (line {e.line}, column {e.column})"),
         EnvelopeError.SegmentCountMismatch e => new("UNT",
             $"Message {e.messageReference}: UNT declares {e.declared} segments, but the message has {e.actual}"),
@@ -109,18 +109,5 @@ public sealed class MsconsAdapter
     {
         var index = position - 2;
         return index >= 0 && index < raw.Segments.Length ? raw.Segments[index].Tag : "UNT";
-    }
-
-    // FParsec messages repeat the position and draw a caret under the input line; the API already
-    // reports line and column, so only the "Expecting: …" part is kept.
-    private static string Expectation(string fparsecMessage)
-    {
-        var lines = fparsecMessage
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Where(l => !l.StartsWith("Error in Ln", StringComparison.Ordinal))
-            .ToList();
-        var expecting = lines.FindIndex(l => l.StartsWith("Expecting", StringComparison.Ordinal));
-        var relevant = expecting >= 0 ? lines.Skip(expecting) : lines;
-        return string.Join(" ", relevant);
     }
 }

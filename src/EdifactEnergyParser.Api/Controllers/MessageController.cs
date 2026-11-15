@@ -51,6 +51,42 @@ public sealed partial class MessageController(
         return Ok(MessageStatusResponse.From(validated));
     }
 
+    /// <summary>
+    /// Explains raw EDIFACT segment by segment: what each segment is for and what each value means.
+    /// Nothing is stored, and the text does not have to be a valid message, so a rejected message
+    /// can be explained too.
+    /// </summary>
+    /// <param name="content">The raw EDIFACT text, sent as <c>text/plain</c>.</param>
+    /// <param name="explainer">Adapter to the F# explainer.</param>
+    /// <response code="200">One entry per segment, UNA included when present.</response>
+    /// <response code="400">The body is empty or not readable text.</response>
+    /// <response code="415">The body is not <c>text/plain</c>.</response>
+    /// <response code="422">The text cannot be split into EDIFACT segments; the detail names line and column.</response>
+    [HttpPost("explain")]
+    [Consumes("text/plain")]
+    [ProducesResponseType<IReadOnlyList<SegmentExplanationResponse>>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status415UnsupportedMediaType)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status422UnprocessableEntity)]
+    public IActionResult Explain([FromBody] string content, [FromServices] ExplainerAdapter explainer)
+    {
+        ArgumentNullException.ThrowIfNull(explainer);
+
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            ModelState.AddModelError(nameof(content), "The body must contain EDIFACT text.");
+            return ValidationProblem(ModelState);
+        }
+
+        if (!explainer.TryExplain(content, out var segments, out var error))
+        {
+            return Problem(statusCode: StatusCodes.Status422UnprocessableEntity, title: "Not EDIFACT", detail: error);
+        }
+
+        LogExplained(segments.Count);
+        return Ok(segments);
+    }
+
     /// <summary>Returns the current state of a message and any rejection reasons.</summary>
     /// <param name="id">The ID returned when the message was received.</param>
     /// <response code="200">The message is known.</response>
@@ -73,4 +109,7 @@ public sealed partial class MessageController(
     [LoggerMessage(Level = LogLevel.Information,
         Message = "Checked message {MessageId} (interchange {ControlReference}): {MessageCount} messages parsed, {ErrorCount} errors")]
     private partial void LogChecked(Guid messageId, string? controlReference, int messageCount, int errorCount);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "Explained {SegmentCount} segments")]
+    private partial void LogExplained(int segmentCount);
 }

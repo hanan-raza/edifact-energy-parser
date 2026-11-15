@@ -17,6 +17,7 @@ builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<IMessageStore, InMemoryMessageStore>();
 builder.Services.AddSingleton<MessageWorkflow>();
 builder.Services.AddSingleton<MsconsAdapter>();
+builder.Services.AddSingleton<ExplainerAdapter>();
 
 var app = builder.Build();
 
