@@ -15,6 +15,7 @@
     <Compile Include="UtilmdParser.fs" />
     <Compile Include="ValidationRules.fs" />
     <Compile Include="EdifactSerializer.fs" />
+    <Compile Include="SegmentExplainer.fs" />
   </ItemGroup>
 
   <ItemGroup>

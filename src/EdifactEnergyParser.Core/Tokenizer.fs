@@ -151,19 +151,12 @@ module Tokenizer =
     let internal delimiters: P<Delimiters> =
         opt serviceStringAdvice |>> Option.defaultValue Delimiters.Default .>> lineBreaks
 
-    let private interchange: P<TokenizedInterchange> =
-        delimiters
-        >>= fun d ->
-            many (segment d .>> lineBreaks) .>> eof
-            |>> fun segments -> { Delimiters = d; Tokens = List.collect toTokens segments }
+    let private allSegments: P<Delimiters * Segment list> =
+        delimiters >>= fun d -> many (segment d .>> lineBreaks) .>> eof |>> fun segments -> d, segments
 
-    /// <summary>
-    /// Tokenizes an EDIFACT interchange. A leading UNA segment sets the delimiters;
-    /// otherwise the ISO 9735 defaults are used.
-    /// </summary>
-    let tokenize (input: string) : Result<TokenizedInterchange, TokenizeError> =
-        // FParsec's ReplyStatus shadows Ok/Error, hence the qualified Result cases.
-        match run interchange input with
+    // FParsec's ReplyStatus shadows Ok/Error, hence the qualified Result cases.
+    let private runToResult (parser: P<'T>) (input: string) : Result<'T, TokenizeError> =
+        match run parser input with
         | Success(result, _, _) -> Result.Ok result
         | Failure(message, error, _) ->
             Result.Error
@@ -172,3 +165,17 @@ module Tokenizer =
                     Line = error.Position.Line
                     Column = error.Position.Column
                 }
+
+    /// <summary>
+    /// Tokenizes an EDIFACT interchange. A leading UNA segment sets the delimiters;
+    /// otherwise the ISO 9735 defaults are used.
+    /// </summary>
+    let tokenize (input: string) : Result<TokenizedInterchange, TokenizeError> =
+        runToResult allSegments input
+        |> Result.map (fun (d, segments) -> { Delimiters = d; Tokens = List.collect toTokens segments })
+
+    /// <summary>
+    /// Splits EDIFACT text into its segments (UNA excluded) without checking the UNB/UNH/UNT/UNZ
+    /// nesting, so that fragments and structurally broken messages can still be inspected.
+    /// </summary>
+    let segments (input: string) : Result<Delimiters * Segment list, TokenizeError> = runToResult allSegments input
