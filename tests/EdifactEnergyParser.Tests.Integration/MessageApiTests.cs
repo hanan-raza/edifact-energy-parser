@@ -5,13 +5,12 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using EdifactEnergyParser.Api.Contracts;
 using EdifactEnergyParser.Workflow;
-using Microsoft.AspNetCore.Mvc.Testing;
 using Shouldly;
 
 namespace EdifactEnergyParser.Tests.Integration;
 
 /// <summary>End to end through HTTP: formatter, controller, F# adapter, workflow and store.</summary>
-public sealed class MessageApiTests(WebApplicationFactory<Program> factory) : IClassFixture<WebApplicationFactory<Program>>
+public sealed class MessageApiTests(ApiFactory factory) : IClassFixture<ApiFactory>
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web)
     {
@@ -27,22 +26,22 @@ public sealed class MessageApiTests(WebApplicationFactory<Program> factory) : IC
         (await response.Content.ReadFromJsonAsync<MessageStatusResponse>(Json)).ShouldNotBeNull();
 
     [Fact]
-    public async Task ValidMsconsIsValidatedAndCanBeFetchedAgain()
+    public async Task ValidMsconsIsProcessedAndCanBeFetchedAgain()
     {
         using var response = await PostAsync(new SyntheticMscons().ToString());
 
         response.StatusCode.ShouldBe(HttpStatusCode.OK);
         var posted = await ReadStatusAsync(response);
-        posted.State.ShouldBe(MessageState.Validated);
+        posted.State.ShouldBe(MessageState.Processed);
         posted.Errors.ShouldBeEmpty();
-        posted.History.Select(h => h.To).ShouldBe([MessageState.Received, MessageState.Validated]);
+        posted.History.Select(h => h.To).ShouldBe([MessageState.Received, MessageState.Validated, MessageState.Processed]);
 
         using var get = await _client.GetAsync(new Uri($"/api/messages/{posted.Id}", UriKind.Relative));
 
         get.StatusCode.ShouldBe(HttpStatusCode.OK);
         var fetched = await ReadStatusAsync(get);
         fetched.Id.ShouldBe(posted.Id);
-        fetched.State.ShouldBe(MessageState.Validated);
+        fetched.State.ShouldBe(MessageState.Processed);
     }
 
     [Fact]
@@ -51,7 +50,7 @@ public sealed class MessageApiTests(WebApplicationFactory<Program> factory) : IC
         using var response = await PostAsync(new SyntheticMscons().ToString());
 
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-        doc.RootElement.GetProperty("state").GetString().ShouldBe("Validated");
+        doc.RootElement.GetProperty("state").GetString().ShouldBe("Processed");
     }
 
     [Fact]

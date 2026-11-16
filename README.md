@@ -23,13 +23,15 @@ This project implements a typed EDIFACT parser in F# — chosen for its pattern-
 - Round-trip guarantee: parse → model → serialize → parse produces identical models (FsCheck property tests)
 - C# ASP.NET Core API: receive → validate → state machine (Received → Validated → Processed/Rejected) → APERAK-style response
 - "Message explainer" endpoint: raw EDIFACT → human-readable JSON description of every segment
-- MSCONS import feeding `meter-data-service` (cross-project integration)
+- MSCONS import feeding `meter-data-service`: every accepted message is `Processed` and its quarter-hour values are uploaded to meter-data-service's `POST /api/import` (typed `HttpClient`, WireMock-tested)
 
 ---
 
 ## Innovation
 
 **Message explainer.** EDIFACT is hard to read for anyone who does not work with it every day: `QTY+67:0.205:KWH` or `NAD+MS+9900000000003::293` mean nothing without the code lists. `POST /api/messages/explain` takes raw EDIFACT and returns every segment as JSON with a description and the meaning of each value: code texts (`67` → substitute value), dates with their UTC offset, market-partner IDs with their code list, OBIS codes, and the UNT/UNZ counts *declared vs. counted*. It only needs text that can be split into segments, so a message the API rejected can be explained to find out why. Support staff and developers can read a message without a handbook open next to them.
+
+**From market message to meter data.** An accepted MSCONS does not stop at a status: its load profiles are handed to [meter-data-service](../meter-data-service), which runs them through the same validation and gap detection as any other import. The hand-over is conservative: a metering point is only forwarded if its values fit meter-data-service's model exactly (15-minute energy, one series per market location), and everything else is skipped with a logged reason instead of being bent to fit.
 
 ---
 
@@ -141,6 +143,8 @@ sequenceDiagram
     participant W as MessageWorkflow
     participant A as MsconsAdapter
     participant F as EdifactEnergyParser.Core
+    participant FW as MeterDataForwarder
+    participant M as meter-data-service
     C->>MC: POST /api/messages (text/plain)
     MC->>W: Receive(content)
     W-->>MC: TrackedMessage (Received)
@@ -149,8 +153,10 @@ sequenceDiagram
     F-->>A: Result / ValidationError list
     A-->>MC: MsconsCheckResult (MessageError list)
     alt no errors
-        MC->>W: MarkValidated(id)
-        MC-->>C: 200 { id, state: "Validated", errors: [], history }
+        MC->>W: MarkValidated(id), MarkProcessed(id)
+        MC->>FW: ForwardAsync(messages)
+        FW->>M: POST /api/import (CSV per metering point)
+        MC-->>C: 200 { id, state: "Processed", errors: [], history }
     else errors
         MC->>W: Reject(id, errors)
         MC-->>C: 422 { id, state: "Rejected", errors: [...], history }
@@ -159,13 +165,26 @@ sequenceDiagram
 
 | Endpoint | Body | Responses |
 |----------|------|-----------|
-| `POST /api/messages` | raw EDIFACT, `Content-Type: text/plain` (UTF-8, or `charset=iso-8859-1` for UNOC files) | `200` validated · `422` rejected, with every error · `400` empty body or bytes that are not valid UTF-8 · `415` not `text/plain` |
+| `POST /api/messages` | raw EDIFACT, `Content-Type: text/plain` (UTF-8, or `charset=iso-8859-1` for UNOC files) | `200` processed (values forwarded) · `422` rejected, with every error · `400` empty body or bytes that are not valid UTF-8 · `415` not `text/plain` |
 | `GET /api/messages/{id}` | – | `200` current state, errors and history · `404` unknown ID (problem details) |
 | `POST /api/messages/explain` | raw EDIFACT, `Content-Type: text/plain` | `200` JSON array `{ segment, description, fields: [{ name, value, meaning }] }` · `422` text cannot be split into segments (problem details with line/column) · `400` empty body · `415` not `text/plain` |
 
-- **Adapter, not DI into F#.** `MsconsAdapter` and `ExplainerAdapter` are the only C# classes that call the F# modules. They stay plain functions; the adapter translates `Result`, F# lists and the error unions (`EnvelopeError`, `MsconsError`) into `MessageError(segment, text)`. Structure errors get the tag of the segment where parsing stopped; syntax errors keep line, column and FParsec's "Expecting: …" but drop its caret drawing. Validation errors are prefixed with the message reference (`Message 1: …`). The adapter also copies the four UNB/UNH values an APERAK needs into a `ReceivedInterchange`.
+- **Adapter, not DI into F#.** `MsconsAdapter`, `ExplainerAdapter` and `MeterReadingMapper` are the only C# classes that touch the F# modules. They stay plain functions; the adapter translates `Result`, F# lists and the error unions (`EnvelopeError`, `MsconsError`) into `MessageError(segment, text)`. Structure errors get the tag of the segment where parsing stopped; syntax errors keep line, column and FParsec's "Expecting: …" but drop its caret drawing. Validation errors are prefixed with the message reference (`Message 1: …`). The adapter also copies the four UNB/UNH values an APERAK needs into a `ReceivedInterchange`.
 - **Store first, then check.** A message is stored as `Received` before parsing, so every message, even unreadable text, gets an ID and a history. Envelope, structure and rule errors all end in `Rejected` (422); only an empty body is a client error (400) with nothing stored.
-- **Validated, not yet Processed.** Handing values to meter-data-service is the processing step; until it exists the API stops at `Validated`.
+- **Processed, then forwarded.** An accepted message moves Received → Validated → Processed in one request, and then `MeterDataForwarder` uploads its values to meter-data-service. A failed upload (service down, 4xx/5xx, 30 s timeout) is logged and does not change the state: the sender's message was fine, so a downstream outage must not become a negative APERAK. One failed batch does not stop the others. The forwarding is not tied to the request's abort token, so a client hanging up cannot leave an interchange half forwarded. A production system would put the batches into an outbox with retries; see *Roadmap*.
+
+The hand-over to meter-data-service (`MeterReadingMapper` in the API, `MeterDataServiceClient` in the workflow project):
+
+| MSCONS | meter-data-service | Rule |
+|--------|--------------------|------|
+| `LOC+172` metering point | `marketLocationId` form field | An 11-digit ID is already a MaLo-ID. A 33-character metering point ID is looked up in `MeterDataService:MarketLocations` (in the market this assignment comes from UTILMD master data); without an entry the point is skipped |
+| `LIN` series | one CSV upload | Only series of 15-minute values in kWh or MWh (MWh × 1000). A point with no such series, or with more than one (e.g. consumption 1.29.0 and feed-in 2.29.0), is skipped: meter-data-service keeps one series per market location, and two would overwrite each other |
+| `QTY` qualifier 220 / 67 / 201 / 20 | `status` Measured / Replaced / Estimated / – | Unusable values (20) are left out, so meter-data-service sees a gap and fills it traceably |
+| `DTM+163` interval start | `timestamp` | Written with the sender's UTC offset (`2026-10-25T02:00:00+01:00`), so both passes of the repeated October hour stay distinct |
+
+- The upload reuses meter-data-service's CSV import (`multipart/form-data` with `file` and `marketLocationId`) rather than a new JSON endpoint, so MSCONS values pass exactly the validation a manual import does. The file is named `<BGM document number>_<metering point>.csv`, which makes an import job traceable to its message.
+- `MeterDataServiceClient` is a typed `HttpClient` registered with `AddHttpClient`; its base URL comes from `MeterDataService:BaseUrl` in `appsettings.json` (`http://localhost:5227`, meter-data-service's dev port). Removing the URL turns forwarding off. The Development settings map the sample's metering points 1 and 2 to two MaLo-IDs; point 3 has two registers and is skipped.
+- meter-data-service only queues the file (202) and rejects it later if the market location is unknown there, so the MaLo must exist in meter-data-service before values for it arrive.
 - **text/plain input.** `PlainTextInputFormatter` reads the body as UTF-8 or as Latin-1 when the client declares it. Latin-1 bytes sent without a charset are refused with a hint instead of being decoded into replacement characters.
 - States are serialized as names (`"Rejected"`), and the store is an in-memory singleton: messages are lost on restart.
 
@@ -183,7 +202,7 @@ The message explainer (`SegmentExplainer.fs`) is a lookup table in F#: segment t
 dotnet run --project src/EdifactEnergyParser.Api
 ```
 
-Receive, parse and validate an MSCONS message (200 with `"state": "Validated"`, or 422 with the error list):
+Receive, parse and validate an MSCONS message (200 with `"state": "Processed"`, or 422 with the error list). If meter-data-service runs on `http://localhost:5227` (`dotnet run --project ../meter-data-service/src/MeterDataService.Api`), the values of the sample's metering points 1 and 2 are imported there; otherwise the failed upload is only logged:
 
 ```bash
 curl -X POST http://localhost:5166/api/messages \
@@ -256,7 +275,8 @@ Excerpt of the response (UNB and the substitute value in the sample):
 | Lastgang | Load profile | Series of interval values (usually 15 minutes) for one metering point and register |
 | OBIS-Kennzahl | OBIS code | Identifies the measured quantity, e.g. `1-1:1.29.0` consumption, `1-1:2.29.0` feed-in, per interval |
 | Wahrer Wert / Ersatzwert / Vorschlagswert | True / substitute / proposed value | Value status from the QTY qualifier (220 / 67 / 201): measured, formed by the metering operator, or suggested |
-| Marktlokation (MaLo) | Market location | Where energy is supplied and billed; 11-digit ID in UTILMD `LOC+Z16` |
+| Marktlokation (MaLo) | Market location | Where energy is supplied and billed; 11-digit ID in UTILMD `LOC+Z16`, and the key under which meter-data-service stores a series |
+| Nicht verwendbarer Wert | Unusable value | Value status 20 in QTY: transmitted but must not be billed; not forwarded to meter-data-service |
 | Vorgang | Transaction | One business case inside a UTILMD message, opened by `IDE+24` with its own transaction ID |
 | Transaktionsgrund | Transaction reason | Why a transaction was sent (`STS+7`), e.g. supplier switch (Wechsel) or move in/out (Ein-/Auszug) |
 | Lieferbeginn / Lieferende | Start / end of supply | When the new supplier starts or stops supplying the market location (`DTM+92` / `DTM+93`) |
@@ -288,8 +308,9 @@ Coverage highlights:
 - Validation: a valid message and the parsed sample (with a zero reading) return `[]`; a message with three violations returns exactly three `ValidationError`s; every violation of a rule is reported; non-13-digit and non-ASCII-digit party IDs; empty metering points; wrong offsets (summer time sent as `+01`, document date in UTC) and both DST transitions (repeated October hour, March switch); custom rule lists and a different zone
 - Workflow state machine (C#, `tests/EdifactEnergyParser.Tests.Workflow`, xUnit + Shouldly): the transition table for all 16 state pairs, every valid transition and every forbidden one reachable through a method (message left unchanged), the accepted path Received → Validated → Processed and both rejection paths with errors and a timestamped history (`FakeTimeProvider`), rejection without errors, unknown IDs, and 16 threads racing to process/reject one message (exactly one wins). The in-memory store refuses duplicate IDs and stale snapshots
 - APERAK generator (same C# test project, which references the F# core only to read responses back): every response is tokenized and parsed by `EnvelopeParser`, so syntax, UNT segment count and UNZ control reference are checked. A rejection names the original control number and every error (code + text, in order); an acceptance carries `BGM` 312 and `ERC+A00`; released delimiters read back unchanged; line breaks, `€` and over-long texts; partners with and without code list; the document date in winter, summer, both passes of the repeated October hour and after the March switch; refusal of rejections without errors and of empty/over-long references; and the response chosen from the workflow state
-- API end to end (`tests/EdifactEnergyParser.Tests.Integration`, `WebApplicationFactory` + a synthetic MSCONS builder): a valid message is `Validated` (200) and can be fetched again; rule violations, a broken UNT count and non-EDIFACT text are `Rejected` (422) with every error and stay stored; states are serialized as names; a Latin-1 body with `charset=iso-8859-1` is accepted and without a charset is a 400 with a hint; empty and whitespace bodies are 400, JSON is 415, unknown and non-GUID IDs are 404. Adapter tests cover the docs sample, the UNB references copied for APERAK, envelope/syntax/structure/wrong-type errors and the segment tag each one names
+- API end to end (`tests/EdifactEnergyParser.Tests.Integration`, `WebApplicationFactory` + a synthetic MSCONS builder): a valid message is `Processed` (200) and can be fetched again; rule violations, a broken UNT count and non-EDIFACT text are `Rejected` (422) with every error and stay stored; states are serialized as names; a Latin-1 body with `charset=iso-8859-1` is accepted and without a charset is a 400 with a hint; empty and whitespace bodies are 400, JSON is 415, unknown and non-GUID IDs are 404. Adapter tests cover the docs sample, the UNB references copied for APERAK, envelope/syntax/structure/wrong-type errors and the segment tag each one names
 - Message explainer (F# unit tests + API end to end): every segment and value of the MSCONS and UTILMD samples and of an APERAK gets a specific meaning (no "not interpreted", unknown code or `null`); UNB names sender and recipient ILN with their code lists; DTM 303 keeps the sent offset, DTM 102 in July is shown as `UTC+02:00`, a time in the March DST gap is explained as unreadable instead of failing; released delimiters are shown unescaped; UNT/UNZ show declared vs. counted values; wrong-length metering point IDs, unknown segments/codes, custom UNA delimiters and text that is not EDIFACT (422 with line/column). A message the receive endpoint rejects is still explained (200)
+- meter-data-service hand-over (`MeterDataForwardingTests`, WireMock.Net stub of meter-data-service): the multipart uploads are read back with `MultipartReader` and compared byte for byte. The sample sends exactly two CSV files (market location, file name, `text/csv`, every row with status Measured/Replaced/Estimated) and skips the point with two registers; a series across the October switch keeps `02:30+02:00 … 02:00+01:00`; MWh become kWh; an 11-digit ID in `LOC` needs no mapping; an unmapped point and a rejected message send nothing; a 503 from meter-data-service leaves the message `Processed` without errors and the next batch is still sent; the real `appsettings` files bind the base URL and mappings. All other API tests run with forwarding off, so they never reach a meter-data-service running locally
 
 ---
 
@@ -301,6 +322,8 @@ See `docs/adr/` for Architecture Decision Records.
 
 ## Roadmap / Next Steps
 
+- Outbox with retries for the meter-data-service hand-over (today a failed upload is only logged)
+- Take metering point → market location assignments from received UTILMD instead of configuration
 - Full UTILMD supplier-switch workflow
 - CONTRL acknowledgement (syntax-level)
 - Performance: parse 1 MB MSCONS in < 100 ms
@@ -309,4 +332,4 @@ See `docs/adr/` for Architecture Decision Records.
 
 ## Kurzfassung auf Deutsch
 
-Dieses Projekt implementiert einen vollständigen EDIFACT-Parser in F# für die im deutschen Energiemarkt verwendeten Nachrichtenformate MSCONS und UTILMD. Der Tokenizer verarbeitet die UNA-Zeichenkette, alle Segmentgruppen sowie Sonderzeichen gemäß den BDEW-Spezifikationen. Mit FParsec-Kombinatoren werden typisierte F#-Modelle erzeugt, die durch komponierbare Validierungsregeln geprüft werden. Eine Round-Trip-Garantie wird durch FsCheck-Eigenschaftstests sichergestellt. Der C#-Workflow-Layer nimmt Nachrichten über eine ASP.NET Core API entgegen, führt sie durch eine Zustandsmaschine und erzeugt APERAK-ähnliche Antworten. Ein „Message Explainer"-Endpunkt übersetzt rohe EDIFACT-Nachrichten in menschenlesbare JSON-Beschreibungen.
+Dieses Projekt implementiert einen vollständigen EDIFACT-Parser in F# für die im deutschen Energiemarkt verwendeten Nachrichtenformate MSCONS und UTILMD. Der Tokenizer verarbeitet die UNA-Zeichenkette, alle Segmentgruppen sowie Sonderzeichen gemäß den BDEW-Spezifikationen. Mit FParsec-Kombinatoren werden typisierte F#-Modelle erzeugt, die durch komponierbare Validierungsregeln geprüft werden. Eine Round-Trip-Garantie wird durch FsCheck-Eigenschaftstests sichergestellt. Der C#-Workflow-Layer nimmt Nachrichten über eine ASP.NET Core API entgegen, führt sie durch eine Zustandsmaschine und erzeugt APERAK-ähnliche Antworten. Ein „Message Explainer"-Endpunkt übersetzt rohe EDIFACT-Nachrichten in menschenlesbare JSON-Beschreibungen. Angenommene MSCONS-Nachrichten werden verarbeitet und ihre Viertelstundenwerte je Marktlokation an den meter-data-service übergeben; Ersatz- und Vorschlagswerte behalten dabei ihren Status, nicht verwendbare Werte werden nicht übertragen.

@@ -13,12 +13,18 @@ internal sealed record SyntheticMscons
     public string SenderId { get; init; } = "9900000000003";
     public string RecipientId { get; init; } = "9900000000010";
     public decimal[] Quantities { get; init; } = [0.250m, 0.198m, 0.205m, 0.231m];
+    public string MeteringPointId { get; init; } = "DE0001234567800000000000000000001";
+    public string Unit { get; init; } = "KWH";
+
+    /// <summary>Start of the first interval; 2026-01-15 00:00 CET by default.</summary>
+    public DateTimeOffset Start { get; init; } = new(2026, 1, 15, 0, 0, 0, TimeSpan.FromHours(1));
 
     /// <summary>Added to the true segment count in UNT, to produce a broken trailer.</summary>
     public int SegmentCountOffset { get; init; }
 
     public override string ToString()
     {
+        var zone = EdifactEnergyParser.Core.EnvelopeParser.marketTimeZone;
         List<string> body =
         [
             "BGM+7+MSI0000001+9",
@@ -27,19 +33,19 @@ internal sealed record SyntheticMscons
             $"NAD+MR+{RecipientId}::293",
             "UNS+D",
             "NAD+DP",
-            "LOC+172+DE0001234567800000000000000000001",
+            $"LOC+172+{MeteringPointId}",
             "LIN+1",
             "PIA+5+1-1?:1.29.0:SRW",
         ];
 
-        // 15-minute intervals on 2026-01-15 from 00:00 (CET, +01).
-        var start = new DateTimeOffset(2026, 1, 15, 0, 0, 0, TimeSpan.FromHours(1));
+        // 15-minute intervals in German time, so a series across a DST switch changes its offset.
+        var start = TimeZoneInfo.ConvertTime(Start, zone);
         foreach (var quantity in Quantities)
         {
-            var end = start.AddMinutes(15);
-            body.Add($"QTY+220:{quantity.ToString(CultureInfo.InvariantCulture)}:KWH");
-            body.Add($"DTM+163:{start:yyyyMMddHHmm}?+01:303");
-            body.Add($"DTM+164:{end:yyyyMMddHHmm}?+01:303");
+            var end = TimeZoneInfo.ConvertTime(start.AddMinutes(15), zone);
+            body.Add($"QTY+220:{quantity.ToString(CultureInfo.InvariantCulture)}:{Unit}");
+            body.Add($"DTM+163:{Format(start)}:303");
+            body.Add($"DTM+164:{Format(end)}:303");
             start = end;
         }
 
@@ -56,4 +62,8 @@ internal sealed record SyntheticMscons
         sb.Append(inv, $"UNZ+1+{ControlReference}'\n");
         return sb.ToString();
     }
+
+    // Format 303: local time plus the UTC offset in hours, with "+" released as "?+".
+    private static string Format(DateTimeOffset local) =>
+        string.Create(CultureInfo.InvariantCulture, $"{local:yyyyMMddHHmm}?+{local.Offset.Hours:00}");
 }

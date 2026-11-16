@@ -17,7 +17,7 @@ public sealed record MsconsCheckResult(
 }
 
 /// <summary>
-/// Together with <see cref="ExplainerAdapter"/> the only place where C# calls the F# core: runs <see cref="EnvelopeParser"/>, <see cref="MsconsParser"/>
+/// Together with <see cref="ExplainerAdapter"/> and <see cref="MeterReadingMapper"/> the only place where C# touches the F# core: runs <see cref="EnvelopeParser"/>, <see cref="MsconsParser"/>
 /// and <see cref="ValidationRules"/> and translates their F# unions into <see cref="MessageError"/>s.
 /// </summary>
 /// <remarks>

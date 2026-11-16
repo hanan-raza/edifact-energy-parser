@@ -1,6 +1,7 @@
 @host = http://localhost:5166
 
-### Receive the sample MSCONS (expects 200, state "Validated")
+### Receive the sample MSCONS (expects 200, state "Processed"; with meter-data-service running on
+### localhost:5227, metering points 1 and 2 are forwarded to its /api/import, point 3 is skipped)
 # @name receive
 POST {{host}}/api/messages
 Content-Type: text/plain

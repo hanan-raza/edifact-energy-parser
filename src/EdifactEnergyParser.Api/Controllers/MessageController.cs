@@ -11,11 +11,15 @@ namespace EdifactEnergyParser.Api.Controllers;
 public sealed partial class MessageController(
     MessageWorkflow workflow,
     MsconsAdapter adapter,
+    MeterDataForwarder forwarder,
     ILogger<MessageController> logger) : ControllerBase
 {
-    /// <summary>Receives an MSCONS interchange, parses and validates it, and moves it through the workflow.</summary>
+    /// <summary>
+    /// Receives an MSCONS interchange, parses and validates it, moves it through the workflow and
+    /// forwards the values of an accepted message to meter-data-service.
+    /// </summary>
     /// <param name="content">The raw EDIFACT text, sent as <c>text/plain</c>.</param>
-    /// <response code="200">The message passed every check and is now <c>Validated</c>.</response>
+    /// <response code="200">The message passed every check and is now <c>Processed</c>.</response>
     /// <response code="400">The body is empty or not readable text.</response>
     /// <response code="415">The body is not <c>text/plain</c>.</response>
     /// <response code="422">The message was stored but rejected; the body lists every reason.</response>
@@ -25,7 +29,7 @@ public sealed partial class MessageController(
     [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status415UnsupportedMediaType)]
     [ProducesResponseType<MessageStatusResponse>(StatusCodes.Status422UnprocessableEntity)]
-    public IActionResult Receive([FromBody] string content)
+    public async Task<IActionResult> Receive([FromBody] string content)
     {
         if (string.IsNullOrWhiteSpace(content))
         {
@@ -45,10 +49,16 @@ public sealed partial class MessageController(
             return UnprocessableEntity(MessageStatusResponse.From(rejected));
         }
 
-        // Processing (handing the values to meter-data-service) is a separate step; until it runs
-        // the message stays Validated.
-        var validated = workflow.MarkValidated(received.Id);
-        return Ok(MessageStatusResponse.From(validated));
+        workflow.MarkValidated(received.Id);
+        var processed = workflow.MarkProcessed(received.Id);
+
+        // Deliberately not tied to the request's abort token: the message is already Processed, and a
+        // client hanging up halfway must not leave only some metering points forwarded. The typed
+        // client's timeout bounds the wait instead.
+        var forwarding = await forwarder.ForwardAsync(check.Messages, CancellationToken.None);
+        LogForwarded(received.Id, forwarding.Forwarded, forwarding.Failed, forwarding.Skipped);
+
+        return Ok(MessageStatusResponse.From(processed));
     }
 
     /// <summary>
@@ -109,6 +119,10 @@ public sealed partial class MessageController(
     [LoggerMessage(Level = LogLevel.Information,
         Message = "Checked message {MessageId} (interchange {ControlReference}): {MessageCount} messages parsed, {ErrorCount} errors")]
     private partial void LogChecked(Guid messageId, string? controlReference, int messageCount, int errorCount);
+
+    [LoggerMessage(Level = LogLevel.Information,
+        Message = "Message {MessageId} handed to meter-data-service: {Forwarded} forwarded, {Failed} failed, {Skipped} metering points skipped")]
+    private partial void LogForwarded(Guid messageId, int forwarded, int failed, int skipped);
 
     [LoggerMessage(Level = LogLevel.Information, Message = "Explained {SegmentCount} segments")]
     private partial void LogExplained(int segmentCount);
