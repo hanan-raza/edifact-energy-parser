@@ -14,6 +14,7 @@
     <Compile Include="ValidationRulesTests.fs" />
     <Compile Include="EdifactSerializerTests.fs" />
     <Compile Include="RoundTripProperties.fs" />
+    <Compile Include="ValidationProperties.fs" />
     <Compile Include="SegmentExplainerTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>

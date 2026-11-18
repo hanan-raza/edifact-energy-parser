@@ -161,3 +161,73 @@ let ``separators inside values are released`` () =
 
     Assert.Contains("BGM+7+A?+B?:C??D?'E+9'", written)
     Assert.Equal(message, parseSingle written)
+
+// ---- UTILMD ---------------------------------------------------------------------------------
+
+let private utilmdSample () =
+    File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "samples", "utilmd_example.edi"))
+
+let private parseUtilmd input =
+    match UtilmdParser.parse input with
+    | Ok [ message ] -> message
+    | other -> failwithf "Expected one message but got %A" other
+
+[<Fact>]
+let ``sample UTILMD survives parse, serialize and parse again`` () =
+    let parsed = parseUtilmd (utilmdSample ())
+
+    Assert.Equal(parsed, parseUtilmd (EdifactSerializer.serializeUtilmd parsed))
+
+[<Fact>]
+let ``serialized UTILMD switch transaction is identical to the sample`` () =
+    let text = withoutLineBreaks (utilmdSample ())
+    let first = text.IndexOf "IDE+24+TX0000001"
+    let second = text.IndexOf "IDE+24+TX0000002"
+    let expectedTransaction = text.Substring(first, second - first)
+
+    let written = EdifactSerializer.serializeUtilmd (parseUtilmd (utilmdSample ()))
+
+    Assert.Contains("UNH+1+UTILMD:D:11A:UN:5.2e'", written)
+    Assert.Contains(expectedTransaction, written)
+
+[<Fact>]
+let ``UTILMD local dates are written as format 303 with the Berlin offset`` () =
+    let written = EdifactSerializer.serializeUtilmd (parseUtilmd (utilmdSample ()))
+
+    // DTM+92:20261201:102 and DTM+93:20271201:102 of the move-in.
+    Assert.Contains("DTM+92:202612010000?+01:303'DTM+93:202712010000?+01:303'STS+7++E01'", written)
+
+[<Fact>]
+let ``UTILMD reason, characteristic and name ambiguities are refused`` () =
+    let parsed = parseUtilmd (utilmdSample ())
+    let switch = parsed.Transactions.Head
+    let withSwitch t = { parsed with Transactions = [ t ] }
+
+    let refused (message: UtilmdMessage) =
+        Assert.Throws<ArgumentException>(fun () -> EdifactSerializer.serializeUtilmd message |> ignore).Message
+
+    Assert.Contains("E03", refused (withSwitch { switch with Reason = OtherReason "E03" }))
+
+    let emptyValue = { switch.MasterData.Head with Characteristics = [ { Code = "Z15"; Value = Some "" } ] }
+    Assert.Contains("is empty", refused (withSwitch { switch with MasterData = [ emptyValue ] }))
+
+    let gapInName = { Role = "Z09"; Id = None; Name = Some "Mustermann, , Max" }
+    Assert.Contains("empty name component", refused (withSwitch { switch with Parties = [ gapInName ] }))
+
+[<Fact>]
+let ``UTILMD party names split into NAD name components at comma and space`` () =
+    let parsed = parseUtilmd (utilmdSample ())
+    let switch = parsed.Transactions.Head
+
+    let parties =
+        [
+            { Role = "Z09"; Id = None; Name = Some "Muster, Erika, Dr." }
+            { Role = "Z04"; Id = Some "9900000000003"; Name = None }
+            { Role = "Z05"; Id = None; Name = Some "Eins,Zwei" }
+        ]
+
+    let message = { parsed with Transactions = [ { switch with Parties = parties } ] }
+    let written = EdifactSerializer.serializeUtilmd message
+
+    Assert.Contains("NAD+Z09+++Muster:Erika:Dr.'NAD+Z04+9900000000003'NAD+Z05+++Eins,Zwei'", written)
+    Assert.Equal(message, parseUtilmd written)

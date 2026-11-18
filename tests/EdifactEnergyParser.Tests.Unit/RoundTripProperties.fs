@@ -160,6 +160,94 @@ module Gens =
                 }
         }
 
+    // ---- UTILMD ----
+
+    /// Any reason, including OtherReason with codes that are neither E01 nor E03.
+    let private reason (c: Content) : Gen<TransactionReason> =
+        Gen.frequency
+            [
+                3, Gen.elements [ SupplierChange; MoveInOrOut ]
+                1, c.Text |> Gen.filter (fun code -> code <> "E01" && code <> "E03") |> Gen.map OtherReason
+            ]
+
+    // The parser joins NAD name components with ", ", so a name is drawn as 1–3 parts joined the
+    // same way. Parts may contain commas and spaces themselves; only names that would split into
+    // an empty part are skipped (they are covered by a unit test of the refusal).
+    let private name (c: Content) : Gen<string> =
+        between 1 3 c.Text
+        |> Gen.map (String.concat ", ")
+        |> Gen.filter (fun n -> n = "" || not (n.Split(", ") |> Array.contains ""))
+
+    let private transactionParty (c: Content) : Gen<TransactionParty> =
+        Gen.map3
+            (fun role id name -> { Role = role; Id = id; Name = name })
+            (Gen.frequency [ 3, Gen.elements [ "Z09"; "Z04"; "Z05"; "DDO" ]; 1, c.Text ])
+            (Gen.optionOf c.Text)
+            (Gen.optionOf (name c))
+
+    let private characteristic (c: Content) : Gen<Characteristic> =
+        Gen.map2 (fun code value -> { Code = code; Value = value }) c.Text (Gen.optionOf c.Text)
+
+    let private masterDataRecord (c: Content) : Gen<MasterDataRecord> =
+        Gen.map2
+            (fun code values -> { GroupCode = code; Characteristics = values })
+            c.Text
+            (between 0 3 (characteristic c))
+
+    let private transaction (c: Content) : Gen<SupplierSwitchTransaction> =
+        gen {
+            let! id = c.Text
+            let! reason = reason c
+            let! start = c.DateTime
+            // The parser rejects an end that is not after the start, so the end is always later:
+            // a quarter hour up to about three years, the same instant written in another offset.
+            let! length = Gen.choose (1, 100_000)
+            let! endOffset = c.DateTime |> Gen.map _.Offset
+            let! hasEnd = Gen.elements [ true; false ]
+            let! marketLocation = c.Text
+            let! meteringLocations = between 0 3 c.Text
+            let! masterData = between 0 3 (masterDataRecord c)
+            let! parties = between 0 3 (transactionParty c)
+
+            return
+                {
+                    TransactionId = id
+                    Reason = reason
+                    StartOfSupply = start
+                    EndOfSupply =
+                        if hasEnd then
+                            Some(start.AddMinutes(15.0 * float length).ToOffset endOffset)
+                        else
+                            None
+                    MarketLocationId = marketLocation
+                    MeteringLocationIds = meteringLocations
+                    MasterData = masterData
+                    Parties = parties
+                }
+        }
+
+    let utilmdMessage (c: Content) : Gen<UtilmdMessage> =
+        gen {
+            let! reference = c.Text
+            let! documentType = c.Text
+            let! documentNumber = c.Text
+            let! documentDate = c.DateTime
+            let! sender = party c
+            let! recipient = party c
+            let! transactions = between 1 3 (transaction c)
+
+            return
+                {
+                    ReferenceNumber = reference
+                    DocumentType = documentType
+                    DocumentNumber = documentNumber
+                    DocumentDate = documentDate
+                    Sender = sender
+                    Recipient = recipient
+                    Transactions = transactions
+                }
+        }
+
     let delimiters: Gen<Delimiters> =
         gen {
             let! structural = Gen.shuffle [| ':'; '+'; '?'; '\''; '*'; '|'; '!'; '#'; '~' |]
@@ -263,6 +351,80 @@ module Shrink =
             for recipient in party m.Recipient -> { m with Recipient = recipient }
         }
 
+    // ---- UTILMD ----
+
+    let private transactionParty (p: TransactionParty) : seq<TransactionParty> =
+        seq {
+            for role in text p.Role -> { p with Role = role }
+            for id in option text p.Id -> { p with Id = id }
+            // A shorter name may split differently, so names only shrink by being dropped.
+            if p.Name.IsSome then
+                yield { p with Name = None }
+        }
+
+    let private characteristic (c: Characteristic) : seq<Characteristic> =
+        seq {
+            for code in text c.Code -> { c with Code = code }
+            for value in option text c.Value -> { c with Value = value }
+        }
+
+    let private masterDataRecord (r: MasterDataRecord) : seq<MasterDataRecord> =
+        seq {
+            if not r.Characteristics.IsEmpty then
+                yield { r with Characteristics = [] }
+
+            for values in removeEach r.Characteristics -> { r with Characteristics = values }
+            for values in each characteristic r.Characteristics -> { r with Characteristics = values }
+            for code in text r.GroupCode -> { r with GroupCode = code }
+        }
+
+    let private transaction (t: SupplierSwitchTransaction) : seq<SupplierSwitchTransaction> =
+        seq {
+            if not t.Parties.IsEmpty then
+                yield { t with Parties = [] }
+
+            if not t.MasterData.IsEmpty then
+                yield { t with MasterData = [] }
+
+            if not t.MeteringLocationIds.IsEmpty then
+                yield { t with MeteringLocationIds = [] }
+
+            if t.EndOfSupply.IsSome then
+                yield { t with EndOfSupply = None }
+
+            if t.StartOfSupply <> simpleTime then
+                yield
+                    { t with
+                        StartOfSupply = simpleTime
+                        EndOfSupply = t.EndOfSupply |> Option.map (fun _ -> simpleTime.AddDays 1.0)
+                    }
+
+            if t.Reason <> SupplierChange then
+                yield { t with Reason = SupplierChange }
+
+            for parties in each transactionParty t.Parties -> { t with Parties = parties }
+            for records in each masterDataRecord t.MasterData -> { t with MasterData = records }
+            for ids in removeEach t.MeteringLocationIds -> { t with MeteringLocationIds = ids }
+            for ids in each text t.MeteringLocationIds -> { t with MeteringLocationIds = ids }
+            for id in text t.TransactionId -> { t with TransactionId = id }
+            for id in text t.MarketLocationId -> { t with MarketLocationId = id }
+        }
+
+    let utilmdMessage (m: UtilmdMessage) : seq<UtilmdMessage> =
+        seq {
+            for transactions in removeEach m.Transactions -> { m with Transactions = transactions }
+            for transactions in each transaction m.Transactions -> { m with Transactions = transactions }
+            for reference in text m.ReferenceNumber -> { m with ReferenceNumber = reference }
+            for documentType in text m.DocumentType -> { m with DocumentType = documentType }
+            for documentNumber in text m.DocumentNumber -> { m with DocumentNumber = documentNumber }
+
+            if m.DocumentDate <> simpleTime then
+                yield { m with DocumentDate = simpleTime }
+
+            for sender in party m.Sender -> { m with Sender = sender }
+            for recipient in party m.Recipient -> { m with Recipient = recipient }
+        }
+
     let delimiters (d: Delimiters) : seq<Delimiters> =
         seq {
             if d <> Delimiters.Default then
@@ -274,12 +436,18 @@ type Representable =
     static member Message() : Arbitrary<MsconsMessage> =
         Arb.fromGenShrink (Gens.message Gens.representable, Shrink.message)
 
+    static member Utilmd() : Arbitrary<UtilmdMessage> =
+        Arb.fromGenShrink (Gens.utilmdMessage Gens.representable, Shrink.utilmdMessage)
+
     static member Delimiters() : Arbitrary<Delimiters> = Arb.fromGenShrink (Gens.delimiters, Shrink.delimiters)
 
 /// Messages that may contain empty texts, characters outside UNOC or times with seconds.
 type Unrestricted =
     static member Message() : Arbitrary<MsconsMessage> =
         Arb.fromGenShrink (Gens.message Gens.unrestricted, Shrink.message)
+
+    static member Utilmd() : Arbitrary<UtilmdMessage> =
+        Arb.fromGenShrink (Gens.utilmdMessage Gens.unrestricted, Shrink.utilmdMessage)
 
     static member Delimiters() : Arbitrary<Delimiters> = Arb.fromGenShrink (Gens.delimiters, Shrink.delimiters)
 
@@ -306,6 +474,42 @@ let ``serialize either refuses a message or writes text that parses back to it``
             None
 
     written |> Option.iter (fun text -> assertRoundTrip text message)
+
+    true
+    |> Prop.classify written.IsNone "refused"
+    |> Prop.classify written.IsSome "written and read back"
+
+// ---- UTILMD ----
+
+let private assertUtilmdRoundTrip (text: string) (message: UtilmdMessage) =
+    match UtilmdParser.parse text with
+    | Ok [ parsed ] when parsed = message -> ()
+    | other -> failwithf "Round trip failed.%sText: %s%sParsed: %A" Environment.NewLine text Environment.NewLine other
+
+[<Property(MaxTest = 10000, Arbitrary = [| typeof<Representable> |])>]
+let ``UTILMD parse (serialize msg) = Ok msg for any delimiters`` (delimiters: Delimiters) (message: UtilmdMessage) =
+    assertUtilmdRoundTrip (EdifactSerializer.serializeUtilmdWith delimiters message) message
+
+    let any f = message.Transactions |> List.exists f
+
+    // Shows that the optional parts were exercised, not just generated.
+    true
+    |> Prop.classify (any (fun t -> t.EndOfSupply.IsSome)) "with end of supply"
+    |> Prop.classify (any (fun t -> t.Parties |> List.exists (fun p -> p.Name |> Option.exists _.Contains(", ")))) "with multi-part name"
+    |> Prop.classify (any (fun t -> t.Reason.IsOtherReason)) "with other reason"
+
+[<Property(MaxTest = 10000, Arbitrary = [| typeof<Unrestricted> |])>]
+let ``UTILMD serialize either refuses a message or writes text that parses back to it``
+    (delimiters: Delimiters)
+    (message: UtilmdMessage)
+    =
+    let written =
+        try
+            Some(EdifactSerializer.serializeUtilmdWith delimiters message)
+        with :? ArgumentException ->
+            None
+
+    written |> Option.iter (fun text -> assertUtilmdRoundTrip text message)
 
     true
     |> Prop.classify written.IsNone "refused"
