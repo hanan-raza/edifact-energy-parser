@@ -133,22 +133,22 @@ module MsconsParser =
         open SegmentGrammar
 
         // Contact details (SG4 CTA/COM) are allowed but not modelled.
-        let private party d : P<Located> =
-            seg d "NAD" .>> opt (seg d "CTA" >>. skipMany (seg d "COM"))
+        let private party: P<Located> =
+            seg "NAD" .>> opt (seg "CTA" >>. skipMany (seg "COM"))
 
-        let private value d : P<RawValue> =
-            pipe2 (seg d "QTY") (many1 (seg d "DTM")) (fun q dates -> { Quantity = q; Dates = dates })
+        let private value: P<RawValue> =
+            pipe2 (seg "QTY") (many1 (seg "DTM")) (fun q dates -> { Quantity = q; Dates = dates })
 
-        let private series d : P<RawSeries> =
-            pipe3 (seg d "LIN") (opt (seg d "PIA")) (many1 (value d)) (fun line product values ->
+        let private series: P<RawSeries> =
+            pipe3 (seg "LIN") (opt (seg "PIA")) (many1 value) (fun line product values ->
                 {
                     Line = line
                     Product = product
                     Values = values
                 })
 
-        let private point d : P<RawPoint> =
-            pipe3 (seg d "LOC") (opt (seg d "RFF")) (many1 (series d)) (fun location reference series ->
+        let private point: P<RawPoint> =
+            pipe3 (seg "LOC") (opt (seg "RFF")) (many1 series) (fun location reference series ->
                 {
                     Location = location
                     Reference = reference
@@ -157,12 +157,12 @@ module MsconsParser =
 
         // UNS separates the header from the detail section; each delivery party (NAD+DP)
         // groups metering points but carries no data of its own.
-        let private message d : P<RawMessage> =
+        let private message: P<RawMessage> =
             pipe4
-                (seg d "BGM")
-                (many1 (seg d "DTM"))
-                (many1 (party d))
-                (seg d "UNS" >>. many1 (seg d "NAD" >>. many1 (point d)) |>> List.concat)
+                (seg "BGM")
+                (many1 (seg "DTM"))
+                (many1 party)
+                (seg "UNS" >>. many1 (seg "NAD" >>. many1 point) |>> List.concat)
                 (fun header dates parties points ->
                     {
                         Header = header
@@ -171,8 +171,7 @@ module MsconsParser =
                         Points = points
                     })
 
-        let parse (d: Delimiters) (body: Segment list) : Result<RawMessage, int * string> =
-            SegmentGrammar.parse (message d) d body
+        let parse (body: Segment list) : Result<RawMessage, int * string> = SegmentGrammar.parse message body
 
     // Stage 2: typed conversion of the located segments.
     type private Context =
@@ -347,17 +346,13 @@ module MsconsParser =
     /// Parses one message of an already parsed envelope. Local times (formats 102/203) are read
     /// in <paramref name="zone"/>; format 303 carries its own offset.
     /// </summary>
-    let parseMessageIn
-        (zone: TimeZoneInfo)
-        (delimiters: Delimiters)
-        (message: EdifactMessage)
-        : Result<MsconsMessage, MsconsError> =
+    let parseMessageIn (zone: TimeZoneInfo) (message: EdifactMessage) : Result<MsconsMessage, MsconsError> =
         let ctx = { Reference = message.ReferenceNumber; Zone = zone }
 
         if message.Identifier.Type <> "MSCONS" then
             Error(NotMscons(message.ReferenceNumber, message.Identifier.Type))
         else
-            Grammar.parse delimiters message.Segments
+            Grammar.parse message.Segments
             |> Result.mapError (fun (position, text) -> StructureError(ctx.Reference, position, text))
             |> Result.bind (convert ctx)
 
@@ -369,7 +364,7 @@ module MsconsParser =
         match EnvelopeParser.parseIn zone input with
         | Error errors -> Error(List.map EnvelopeInvalid errors)
         | Ok envelope ->
-            let results = envelope.Messages |> List.map (parseMessageIn zone envelope.Delimiters)
+            let results = envelope.Messages |> List.map (parseMessageIn zone)
 
             match results |> List.choose (function Error e -> Some e | Ok _ -> None) with
             | [] -> Ok(results |> List.choose (function Ok m -> Some m | Error _ -> None))

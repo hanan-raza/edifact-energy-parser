@@ -46,7 +46,7 @@ public sealed class MsconsAdapter
 
         foreach (var raw in envelope.Messages)
         {
-            var parsed = MsconsParser.parseMessageIn(EnvelopeParser.marketTimeZone, envelope.Delimiters, raw);
+            var parsed = MsconsParser.parseMessageIn(EnvelopeParser.marketTimeZone, raw);
             if (parsed.IsError)
             {
                 errors.Add(FromMscons(parsed.ErrorValue, raw));

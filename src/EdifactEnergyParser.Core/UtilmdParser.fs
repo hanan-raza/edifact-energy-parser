@@ -123,20 +123,20 @@ module UtilmdParser =
         open SegmentGrammar
 
         // Contact details (CTA/COM) are allowed but not modelled.
-        let private party d : P<Located> =
-            seg d "NAD" .>> opt (seg d "CTA" >>. skipMany (seg d "COM"))
+        let private party: P<Located> =
+            seg "NAD" .>> opt (seg "CTA" >>. skipMany (seg "COM"))
 
-        let private record d : P<RawRecord> =
-            pipe2 (seg d "SEQ") (many (seg d "CAV")) (fun sequence values -> { Sequence = sequence; Values = values })
+        let private record: P<RawRecord> =
+            pipe2 (seg "SEQ") (many (seg "CAV")) (fun sequence values -> { Sequence = sequence; Values = values })
 
         // UTILMD has no UNS: the header parties end where the first IDE starts.
-        let private transaction d : P<RawTransaction> =
+        let private transaction: P<RawTransaction> =
             pipe5
-                (seg d "IDE")
-                (many (seg d "DTM"))
-                (seg d "STS")
-                (many1 (seg d "LOC"))
-                (tuple2 (many (record d)) (many (seg d "NAD")))
+                (seg "IDE")
+                (many (seg "DTM"))
+                (seg "STS")
+                (many1 (seg "LOC"))
+                (tuple2 (many record) (many (seg "NAD")))
                 (fun ident dates status locations (records, parties) ->
                     {
                         Ident = ident
@@ -147,8 +147,8 @@ module UtilmdParser =
                         Parties = parties
                     })
 
-        let private message d : P<RawMessage> =
-            pipe4 (seg d "BGM") (many1 (seg d "DTM")) (many1 (party d)) (many1 (transaction d)) (fun header dates parties transactions ->
+        let private message: P<RawMessage> =
+            pipe4 (seg "BGM") (many1 (seg "DTM")) (many1 party) (many1 transaction) (fun header dates parties transactions ->
                 {
                     Header = header
                     Dates = dates
@@ -156,8 +156,7 @@ module UtilmdParser =
                     Transactions = transactions
                 })
 
-        let parse (d: Delimiters) (body: Segment list) : Result<RawMessage, int * string> =
-            SegmentGrammar.parse (message d) d body
+        let parse (body: Segment list) : Result<RawMessage, int * string> = SegmentGrammar.parse message body
 
     // Stage 2: typed conversion of the located segments.
     type private Context =
@@ -335,17 +334,13 @@ module UtilmdParser =
     /// Parses one message of an already parsed envelope. Local times (formats 102/203) are read
     /// in <paramref name="zone"/>; format 303 carries its own offset.
     /// </summary>
-    let parseMessageIn
-        (zone: TimeZoneInfo)
-        (delimiters: Delimiters)
-        (message: EdifactMessage)
-        : Result<UtilmdMessage, UtilmdError> =
+    let parseMessageIn (zone: TimeZoneInfo) (message: EdifactMessage) : Result<UtilmdMessage, UtilmdError> =
         let ctx = { Reference = message.ReferenceNumber; Zone = zone }
 
         if message.Identifier.Type <> "UTILMD" then
             Error(UtilmdError.NotUtilmd(message.ReferenceNumber, message.Identifier.Type))
         else
-            Grammar.parse delimiters message.Segments
+            Grammar.parse message.Segments
             |> Result.mapError (fun (position, text) -> UtilmdError.StructureError(ctx.Reference, position, text))
             |> Result.bind (convert ctx)
 
@@ -357,7 +352,7 @@ module UtilmdParser =
         match EnvelopeParser.parseIn zone input with
         | Error errors -> Error(List.map UtilmdError.EnvelopeInvalid errors)
         | Ok envelope ->
-            let results = envelope.Messages |> List.map (parseMessageIn zone envelope.Delimiters)
+            let results = envelope.Messages |> List.map (parseMessageIn zone)
 
             match results |> List.choose (function Error e -> Some e | Ok _ -> None) with
             | [] -> Ok(results |> List.choose (function Ok m -> Some m | Error _ -> None))

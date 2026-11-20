@@ -23,6 +23,7 @@ This project implements a typed EDIFACT parser in F# — chosen for its pattern-
 - Round-trip guarantee for MSCONS and UTILMD: parse → model → serialize → parse produces identical models (FsCheck property tests)
 - C# ASP.NET Core API: receive → validate → state machine (Received → Validated → Processed/Rejected) → APERAK-style response
 - "Message explainer" endpoint: raw EDIFACT → human-readable JSON description of every segment
+- Measured performance: BenchmarkDotNet suite for 100 KiB and 1 MiB MSCONS files, 1 MiB in ~120 ms ([docs/benchmarks.md](docs/benchmarks.md))
 - MSCONS import feeding `meter-data-service`: every accepted message is `Processed` and its quarter-hour values are uploaded to meter-data-service's `POST /api/import` (typed `HttpClient`, WireMock-tested)
 
 ---
@@ -60,7 +61,7 @@ The envelope parser (`EnvelopeParser.fs`) works in three stages:
 UNB has no UTC offset, so the preparation time is read as local time in `Europe/Berlin` (or a zone passed to `parseIn`). A time in the repeated October hour counts as daylight time; a time in the skipped March hour is rejected. `EnvelopeWriter` serializes an envelope back to text and recomputes the trailer counts.
 
 The MSCONS parser (`MsconsParser.fs`) takes the body segments of each message and follows the same two-stage pattern:
-1. **Grammar (FParsec)** — header `BGM`, `DTM`…, `NAD`…, `UNS`; then per delivery party `NAD+DP` → `LOC [RFF]` → `LIN [PIA]` → `QTY DTM…` (each level repeating), with `opt` for the optional meter number (RFF), OBIS code (PIA) and contact (CTA/COM). FParsec reads characters, so the body is rendered one segment per line; the error line then gives the segment position as APERAK counts it (UNH = 1), e.g. `Expected LOC segment, found LIN` at position 8.
+1. **Grammar (FParsec)** — header `BGM`, `DTM`…, `NAD`…, `UNS`; then per delivery party `NAD+DP` → `LOC [RFF]` → `LIN [PIA]` → `QTY DTM…` (each level repeating), with `opt` for the optional meter number (RFF), OBIS code (PIA) and contact (CTA/COM). FParsec reads characters, so the grammar runs over the body's segment tags, one per line, with the already tokenized segments as FParsec user state (no second tokenizer pass, see [docs/benchmarks.md](docs/benchmarks.md)); the error line then gives the segment position as APERAK counts it (UNH = 1), e.g. `Expected LOC segment, found LIN` at position 8.
 2. **Typed conversion** — into `MsconsMessage` → `MeteringPoint` → `TimeSeries` → `IntervalValue` with a `decimal` `Quantity`, its unit (KWH, MWH, KWT, MAW, MTQ) and a `ValueStatus` from the QTY qualifier (220 true value, 67 substitute, 201 proposed, 20 unusable). DTM format 303 keeps the sender's UTC offset, so a quarter hour across the October switch (`02:45+02` → `02:00+01`) is 15 minutes; formats 102/203 are read as German local time.
 
 Only the segments needed for interval values are modelled; anything else in the body is a `StructureError`, not silently ignored.
@@ -313,6 +314,7 @@ Coverage highlights:
 - APERAK generator (same C# test project, which references the F# core only to read responses back): every response is tokenized and parsed by `EnvelopeParser`, so syntax, UNT segment count and UNZ control reference are checked. A rejection names the original control number and every error (code + text, in order); an acceptance carries `BGM` 312 and `ERC+A00`; released delimiters read back unchanged; line breaks, `€` and over-long texts; partners with and without code list; the document date in winter, summer, both passes of the repeated October hour and after the March switch; refusal of rejections without errors and of empty/over-long references; and the response chosen from the workflow state
 - API end to end (`tests/EdifactEnergyParser.Tests.Integration`, `WebApplicationFactory` + a synthetic MSCONS builder): a valid message is `Processed` (200) and can be fetched again; rule violations, a broken UNT count and non-EDIFACT text are `Rejected` (422) with every error and stay stored; states are serialized as names; a Latin-1 body with `charset=iso-8859-1` is accepted and without a charset is a 400 with a hint; empty and whitespace bodies are 400, JSON is 415, unknown and non-GUID IDs are 404. Adapter tests cover the docs sample, the UNB references copied for APERAK, envelope/syntax/structure/wrong-type errors and the segment tag each one names
 - Message explainer (F# unit tests + API end to end): every segment and value of the MSCONS and UTILMD samples and of an APERAK gets a specific meaning (no "not interpreted", unknown code or `null`); UNB names sender and recipient ILN with their code lists; DTM 303 keeps the sent offset, DTM 102 in July is shown as `UTC+02:00`, a time in the March DST gap is explained as unreadable instead of failing; released delimiters are shown unescaped; UNT/UNZ show declared vs. counted values; wrong-length metering point IDs, unknown segments/codes, custom UNA delimiters and text that is not EDIFACT (422 with line/column). A message the receive endpoint rejects is still explained (200)
+- Large messages (`LargeMessageTests`): a generated 1 MiB MSCONS (~135 metering points × 96 quarter hours) parses with every point and value. The same generator feeds the BenchmarkDotNet suite in `benchmarks/`. A 1 MiB message parses in ~120 ms (Server GC) and 100 KiB in ~12 ms; see [docs/benchmarks.md](docs/benchmarks.md) for before/after numbers and the two hotspots that were fixed
 - meter-data-service hand-over (`MeterDataForwardingTests`, WireMock.Net stub of meter-data-service): the multipart uploads are read back with `MultipartReader` and compared byte for byte. The sample sends exactly two CSV files (market location, file name, `text/csv`, every row with status Measured/Replaced/Estimated) and skips the point with two registers; a series across the October switch keeps `02:30+02:00 … 02:00+01:00`; MWh become kWh; an 11-digit ID in `LOC` needs no mapping; an unmapped point and a rejected message send nothing; a 503 from meter-data-service leaves the message `Processed` without errors and the next batch is still sent; the real `appsettings` files bind the base URL and mappings. All other API tests run with forwarding off, so they never reach a meter-data-service running locally
 
 ---
@@ -329,7 +331,7 @@ See `docs/adr/` for Architecture Decision Records.
 - Take metering point → market location assignments from received UTILMD instead of configuration
 - Full UTILMD supplier-switch workflow
 - CONTRL acknowledgement (syntax-level)
-- Performance: parse 1 MB MSCONS in < 100 ms
+- Performance: stream metering points out of large MSCONS files instead of holding the whole message in memory (1 MiB currently parses in ~120 ms, see [docs/benchmarks.md](docs/benchmarks.md))
 
 ---
 

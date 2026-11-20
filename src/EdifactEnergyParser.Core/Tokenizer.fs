@@ -85,6 +85,7 @@ type TokenizeError =
 
 /// <summary>Turns raw EDIFACT text into a flat <see cref="Token"/> stream.</summary>
 module Tokenizer =
+    open System.Text
     open FParsec
 
     type internal P<'T> = Parser<'T, unit>
@@ -113,27 +114,75 @@ module Tokenizer =
                     SegmentTerminator = s[5]
                 }
 
-    let private value (d: Delimiters) : P<string> =
+    let private isTagChar c = isAsciiUpper c || isDigit c
+
+    /// One segment including its terminator, read with the given delimiters.
+    // Hand-written on FParsec's CharStream instead of composed from many/sepBy1/manyStrings: this
+    // is the innermost loop of every parse, and the combinator version spent most of its time in
+    // closures and intermediate replies (see docs/benchmarks.md). It keeps the combinator
+    // contract: no input is consumed when no segment tag is ahead, newlines inside values are
+    // normalized to '\n', and errors carry the stream position.
+    let internal segment (d: Delimiters) : P<Segment> =
         let isPlain c =
             c <> d.ComponentSeparator
             && c <> d.DataElementSeparator
             && c <> d.SegmentTerminator
             && c <> d.ReleaseCharacter
 
-        let plain = many1Satisfy isPlain
-        let released = pchar d.ReleaseCharacter >>. (anyChar <?> "character after release character") |>> string
-        manyStrings (plain <|> released)
+        let tagExpected = FParsec.Error.expected "three-character segment tag"
+        let releasedExpected = FParsec.Error.expected "character after release character"
 
-    let private segmentTag: P<string> =
-        manyMinMaxSatisfyL 3 3 (fun c -> isAsciiUpper c || isDigit c) "three-character segment tag"
+        let separatorExpected =
+            [ d.DataElementSeparator; d.ComponentSeparator; d.SegmentTerminator ]
+            |> List.map (string >> FParsec.Error.expectedString)
+            |> List.reduce FParsec.Error.mergeErrors
 
-    let private dataElement (d: Delimiters) : P<string list> =
-        pchar d.DataElementSeparator >>. sepBy1 (value d) (pchar d.ComponentSeparator)
+        // ValueNone means the input ended right after a release character.
+        let readValue (stream: CharStream<unit>) : string voption =
+            let plain = stream.ReadCharsOrNewlinesWhile(isPlain, true)
 
-    /// One segment including its terminator, read with the given delimiters.
-    let internal segment (d: Delimiters) : P<Segment> =
-        pipe2 segmentTag (many (dataElement d) .>> pchar d.SegmentTerminator) (fun tag elements ->
-            { Tag = tag; Elements = elements })
+            if stream.Peek() <> d.ReleaseCharacter then
+                ValueSome plain
+            else
+                let text = StringBuilder(plain)
+
+                let rec released () =
+                    if not (stream.Skip d.ReleaseCharacter) then
+                        ValueSome(text.ToString())
+                    elif stream.IsEndOfStream then
+                        ValueNone
+                    else
+                        text.Append(stream.ReadCharOrNewline()).Append(stream.ReadCharsOrNewlinesWhile(isPlain, true))
+                        |> ignore
+
+                        released ()
+
+                released ()
+
+        let rec components (stream: CharStream<unit>) (acc: string list) : string list voption =
+            match readValue stream with
+            | ValueNone -> ValueNone
+            | ValueSome v when stream.Skip d.ComponentSeparator -> components stream (v :: acc)
+            | ValueSome v -> ValueSome(List.rev (v :: acc))
+
+        let rec elements (stream: CharStream<unit>) (acc: string list list) : string list list voption =
+            if stream.Skip d.DataElementSeparator then
+                match components stream [] with
+                | ValueNone -> ValueNone
+                | ValueSome c -> elements stream (c :: acc)
+            else
+                ValueSome(List.rev acc)
+
+        fun stream ->
+            if isTagChar (stream.Peek()) && isTagChar (stream.Peek 1) && isTagChar (stream.Peek 2) then
+                let tag = stream.Read 3
+
+                match elements stream [] with
+                | ValueNone -> Reply(ReplyStatus.Error, releasedExpected)
+                | ValueSome parsed when stream.Skip d.SegmentTerminator -> Reply { Tag = tag; Elements = parsed }
+                | ValueSome _ -> Reply(ReplyStatus.Error, separatorExpected)
+            else
+                Reply(ReplyStatus.Error, tagExpected)
 
     let private toTokens (s: Segment) : Token list =
         let element =

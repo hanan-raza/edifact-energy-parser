@@ -9,14 +9,18 @@ type internal Located = { Segment: Segment; Position: int }
 module internal SegmentGrammar =
     open FParsec
 
-    type P<'T> = Parser<'T, unit>
+    /// The user state is the already tokenized body, indexed by line.
+    type P<'T> = Parser<'T, Segment[]>
 
-    // FParsec reads characters, so the body is rendered one segment per line; the line number
-    // then gives the segment position.
-    let seg (d: Delimiters) (tag: string) : P<Located> =
-        pipe2 getPosition (followedByString tag <?> $"{tag} segment" >>. Tokenizer.segment d) (fun pos s ->
-            { Segment = s; Position = int pos.Line + 1 })
-        .>> skipNewline
+    // FParsec reads characters, so the grammar runs over the body's tags, one per line. The line
+    // number then indexes the tokenized segment and gives the segment position. Rendering whole
+    // segments here would tokenize every segment a second time, which cost more than the
+    // envelope parse itself (see docs/benchmarks.md).
+    let seg (tag: string) : P<Located> =
+        getPosition .>> (skipString tag <?> $"{tag} segment") .>> skipNewline .>>. getUserState
+        |>> fun (pos, body) ->
+            let index = int pos.Line - 1
+            { Segment = body[index]; Position = index + 2 }
 
     let private expected (error: ParserError) : string =
         let labels =
@@ -28,17 +32,17 @@ module internal SegmentGrammar =
         if labels.Length = 0 then "Unexpected segment" else "Expected " + String.Join(" or ", labels)
 
     /// Runs a message grammar over the body; an error carries the segment position and a description.
-    let parse (grammar: P<'T>) (d: Delimiters) (body: Segment list) : Result<'T, int * string> =
-        let text =
-            body |> List.map (fun s -> EnvelopeWriter.writeSegment d s + "\n") |> String.concat ""
+    let parse (grammar: P<'T>) (body: Segment list) : Result<'T, int * string> =
+        let segments = List.toArray body
+        let tags = segments |> Array.map (fun s -> s.Tag + "\n") |> String.concat ""
 
-        match run (grammar .>> (eof <?> "end of message")) text with
+        match runParserOnString (grammar .>> (eof <?> "end of message")) segments "" tags with
         | Success(raw, _, _) -> Result.Ok raw
         | Failure(_, error, _) ->
             let position = int error.Position.Line + 1
 
             // Position past the body means the message ended early, i.e. UNT was found.
             let found =
-                body |> List.tryItem (position - 2) |> Option.map _.Tag |> Option.defaultValue "UNT"
+                segments |> Array.tryItem (position - 2) |> Option.map _.Tag |> Option.defaultValue "UNT"
 
             Result.Error(position, $"{expected error}, found {found}")
