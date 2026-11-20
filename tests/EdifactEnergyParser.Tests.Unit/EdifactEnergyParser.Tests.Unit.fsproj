@@ -16,6 +16,8 @@
     <Compile Include="RoundTripProperties.fs" />
     <Compile Include="ValidationProperties.fs" />
     <Compile Include="SegmentExplainerTests.fs" />
+    <Compile Include="..\..\benchmarks\EdifactEnergyParser.Benchmarks\LargeMscons.fs" Link="LargeMscons.fs" />
+    <Compile Include="LargeMessageTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
