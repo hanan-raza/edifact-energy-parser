@@ -70,6 +70,22 @@ public sealed class MessageApiTests(ApiFactory factory) : IClassFixture<ApiFacto
         fetched.Errors.Count.ShouldBe(2);
     }
 
+    // The README's sample table promises these outcomes, so the docs files are posted as they are.
+    [Theory]
+    [InlineData("mscons_example.edi", HttpStatusCode.OK, MessageState.Processed, new string[0])]
+    [InlineData("mscons_dst_october.edi", HttpStatusCode.OK, MessageState.Processed, new string[0])]
+    [InlineData("mscons_rejected.edi", HttpStatusCode.UnprocessableEntity, MessageState.Rejected, new[] { "DTM", "NAD", "QTY" })]
+    public async Task SampleFileFromTheDocsGetsTheDocumentedOutcome(
+        string sample, HttpStatusCode status, MessageState state, string[] errorSegments)
+    {
+        using var response = await PostAsync(File.ReadAllText(Path.Combine(AppContext.BaseDirectory, sample)));
+
+        response.StatusCode.ShouldBe(status);
+        var result = await ReadStatusAsync(response);
+        result.State.ShouldBe(state);
+        result.Errors.Select(e => e.Segment).Distinct().ShouldBe(errorSegments, ignoreOrder: true);
+    }
+
     [Fact]
     public async Task BrokenEnvelopeIsRejectedWith422()
     {

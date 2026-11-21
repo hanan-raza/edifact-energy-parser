@@ -10,6 +10,8 @@
 
 Market communication in the German energy market is governed by EDIFACT-based message formats defined by the BDEW. Every supplier switch (Lieferantenwechsel), meter reading submission (MSCONS), and master data exchange (UTILMD) travels as a structured EDIFACT text file. Parsing these files correctly requires handling escape characters, optional segments, conditional group structures, and strict validation against the applicable application handbook (Anwendungshandbuch).
 
+The hard parts are rarely the happy path. A load profile spans the October clock change, so `02:00` occurs twice in one day and only the UTC offset tells the two quarter hours apart. A metering operator replaces a broken reading with a substitute value (Ersatzwert), and that status must survive all the way into billing. A message that breaks a rule must be answered with an APERAK that names *every* problem and where it is, because the sender fixes and resends the whole message. Parsers that split on `'` and `+`, read times as local, or stop at the first error get each of these wrong.
+
 This project implements a typed EDIFACT parser in F# — chosen for its pattern-matching strength and discriminated unions that map naturally to segment alternatives — with a C# workflow layer that processes incoming messages through a state machine and generates APERAK-style acknowledgements.
 
 ---
@@ -213,7 +215,60 @@ curl -X POST http://localhost:5166/api/messages \
 curl http://localhost:5166/api/messages/<id from the response>
 ```
 
-`src/EdifactEnergyParser.Api/EdifactEnergyParser.Api.http` has the same requests plus a rejected message and an unknown ID.
+`src/EdifactEnergyParser.Api/EdifactEnergyParser.Api.http` has the same requests plus the other samples, a rejected message and an unknown ID.
+
+### Sample messages
+
+All samples in [`docs/samples/`](docs/samples/) are synthetic (made-up market-partner IDs, metering points and customers) and are parsed by the test suite (`SampleFileTests`), so they cannot silently drift from what the parser accepts.
+
+| File | Message | What it shows | `POST /api/messages` |
+|------|---------|---------------|----------------------|
+| [`mscons_example.edi`](docs/samples/mscons_example.edi) | MSCONS | 3 metering points: household consumption with a substitute value, PV feed-in with a proposed value, and a point with two registers (consumption + feed-in) | 200 Processed |
+| [`mscons_dst_october.edi`](docs/samples/mscons_dst_october.edi) | MSCONS | Quarter hours from 01:45 to 02:45 on 25 Oct 2026; `02:00+02` and `02:00+01` are both present and every interval is 15 minutes | 200 Processed |
+| [`mscons_rejected.edi`](docs/samples/mscons_rejected.edi) | MSCONS | Well-formed but breaks three rules: 12-digit sender ID, a negative quantity, and a July time sent with the winter offset `+01` | 422 Rejected, every error listed |
+| [`utilmd_example.edi`](docs/samples/utilmd_example.edi) | UTILMD | Supplier switch (`E03`) and a move-in (`E01`) with end of supply, master data (load profile H0/G0, annual consumption), end customers | – (only MSCONS is received; use `/explain`) |
+| [`utilmd_move_in.edi`](docs/samples/utilmd_move_in.edi) | UTILMD | Move-in starting on the March DST day (local date `102`), two metering locations, a released `?+` in a company name; a supplier switch starting in summer time (`+02`) | – (use `/explain`) |
+
+How the household metering point in `mscons_example.edi` reads:
+
+```
+UNA:+.? '                                         delimiters: component : element + decimal . release ? segment '
+UNB+UNOC:3+9900000000003:500+9900000000010:500+260116:0630+MSC0000001'   interchange: sender, recipient, time, control ref
+UNH+1+MSCONS:D:04B:UN:2.4c'                       message 1 is an MSCONS
+BGM+7+MSI0000001+9'                               document number MSI0000001, original
+DTM+137:202601160630?+01:303'                     document date 16 Jan 2026 06:30 +01 (?+ is a released +)
+NAD+MS+9900000000003::293'                        sender (BDEW code number)
+NAD+MR+9900000000010::293'                        recipient
+UNS+D'                                            end of header, detail section follows
+NAD+DP'                                           delivery party group
+LOC+172+DE0001234567800000000000000000001'        metering point (33-character ID)
+RFF+MG:1EMH0012345678'                            meter number
+LIN+1'                                            series 1
+PIA+5+1-1?:1.29.0:SRW'                            OBIS 1-1:1.29.0 = consumption per quarter hour
+QTY+220:0.250:KWH'                                true value 0.250 kWh
+DTM+163:202601150000?+01:303'                     interval start 00:00 +01
+DTM+164:202601150015?+01:303'                     interval end   00:15 +01
+QTY+67:0.205:KWH'                                 substitute value (Ersatzwert) formed by the metering operator
+…
+UNT+45+1'                                         45 segments in message 1 (UNH and UNT included)
+UNZ+1+MSC0000001'                                 1 message, repeats the control ref
+```
+
+A UTILMD transaction (`utilmd_example.edi`), one business case per `IDE`:
+
+```
+IDE+24+TX0000001'                                 transaction TX0000001
+DTM+92:202612010000?+01:303'                      start of supply 1 Dec 2026 00:00 +01
+STS+7++E03'                                       reason: supplier switch (Lieferantenwechsel)
+LOC+Z16+51238696781'                              market location (MaLo, 11 digits)
+LOC+Z17+DE0001234567800000000000000000001'        metering location belonging to it
+SEQ+Z01'                                          master data group
+CAV+Z15:::H0'                                     standard load profile H0 (household)
+CAV+Z16:::3500'                                   forecast annual consumption 3500 kWh
+NAD+Z09+++Mustermann:Max'                         end customer
+```
+
+`POST /api/messages/explain` produces the same annotations as JSON for any of these files.
 
 Explain a message segment by segment:
 
@@ -315,6 +370,7 @@ Coverage highlights:
 - API end to end (`tests/EdifactEnergyParser.Tests.Integration`, `WebApplicationFactory` + a synthetic MSCONS builder): a valid message is `Processed` (200) and can be fetched again; rule violations, a broken UNT count and non-EDIFACT text are `Rejected` (422) with every error and stay stored; states are serialized as names; a Latin-1 body with `charset=iso-8859-1` is accepted and without a charset is a 400 with a hint; empty and whitespace bodies are 400, JSON is 415, unknown and non-GUID IDs are 404. Adapter tests cover the docs sample, the UNB references copied for APERAK, envelope/syntax/structure/wrong-type errors and the segment tag each one names
 - Message explainer (F# unit tests + API end to end): every segment and value of the MSCONS and UTILMD samples and of an APERAK gets a specific meaning (no "not interpreted", unknown code or `null`); UNB names sender and recipient ILN with their code lists; DTM 303 keeps the sent offset, DTM 102 in July is shown as `UTC+02:00`, a time in the March DST gap is explained as unreadable instead of failing; released delimiters are shown unescaped; UNT/UNZ show declared vs. counted values; wrong-length metering point IDs, unknown segments/codes, custom UNA delimiters and text that is not EDIFACT (422 with line/column). A message the receive endpoint rejects is still explained (200)
 - Large messages (`LargeMessageTests`): a generated 1 MiB MSCONS (~135 metering points × 96 quarter hours) parses with every point and value. The same generator feeds the BenchmarkDotNet suite in `benchmarks/`. A 1 MiB message parses in ~120 ms (Server GC) and 100 KiB in ~12 ms; see [docs/benchmarks.md](docs/benchmarks.md) for before/after numbers and the two hotspots that were fixed
+- Sample files (`SampleFileTests` + `MessageApiTests`): every file in `docs/samples/` is accounted for, parses, and gets a specific explanation for every value; the valid MSCONS samples pass all rules and are `Processed` through the API, the rejected one is a 422 naming the DTM, NAD and QTY problems. The October sample has 8 contiguous 15-minute values summing to exactly 0.828 kWh with `02:00+02` and `02:00+01` both present and survives serialize → parse; the UTILMD move-in starts at `2027-03-28 00:00+01` (local date on the March DST day) and the following switch at `00:00+02`
 - meter-data-service hand-over (`MeterDataForwardingTests`, WireMock.Net stub of meter-data-service): the multipart uploads are read back with `MultipartReader` and compared byte for byte. The sample sends exactly two CSV files (market location, file name, `text/csv`, every row with status Measured/Replaced/Estimated) and skips the point with two registers; a series across the October switch keeps `02:30+02:00 … 02:00+01:00`; MWh become kWh; an 11-digit ID in `LOC` needs no mapping; an unmapped point and a rejected message send nothing; a 503 from meter-data-service leaves the message `Processed` without errors and the next batch is still sent; the real `appsettings` files bind the base URL and mappings. All other API tests run with forwarding off, so they never reach a meter-data-service running locally
 
 ---
@@ -344,4 +400,4 @@ Smaller decisions are documented where they apply: [docs/benchmarks.md](docs/ben
 
 ## Kurzfassung auf Deutsch
 
-Dieses Projekt implementiert einen vollständigen EDIFACT-Parser in F# für die im deutschen Energiemarkt verwendeten Nachrichtenformate MSCONS und UTILMD. Der Tokenizer verarbeitet die UNA-Zeichenkette, alle Segmentgruppen sowie Sonderzeichen gemäß den BDEW-Spezifikationen. Mit FParsec-Kombinatoren werden typisierte F#-Modelle erzeugt, die durch komponierbare Validierungsregeln geprüft werden. Eine Round-Trip-Garantie wird durch FsCheck-Eigenschaftstests sichergestellt. Der C#-Workflow-Layer nimmt Nachrichten über eine ASP.NET Core API entgegen, führt sie durch eine Zustandsmaschine und erzeugt APERAK-ähnliche Antworten. Ein „Message Explainer"-Endpunkt übersetzt rohe EDIFACT-Nachrichten in menschenlesbare JSON-Beschreibungen. Angenommene MSCONS-Nachrichten werden verarbeitet und ihre Viertelstundenwerte je Marktlokation an den meter-data-service übergeben; Ersatz- und Vorschlagswerte behalten dabei ihren Status, nicht verwendbare Werte werden nicht übertragen.
+Dieses Projekt implementiert einen vollständigen EDIFACT-Parser in F# für die im deutschen Energiemarkt verwendeten Nachrichtenformate MSCONS und UTILMD. Der Tokenizer verarbeitet die UNA-Zeichenkette, alle Segmentgruppen sowie Sonderzeichen gemäß den BDEW-Spezifikationen. Mit FParsec-Kombinatoren werden typisierte F#-Modelle erzeugt, die durch komponierbare Validierungsregeln geprüft werden. Eine Round-Trip-Garantie wird durch FsCheck-Eigenschaftstests sichergestellt. Der C#-Workflow-Layer nimmt Nachrichten über eine ASP.NET Core API entgegen, führt sie durch eine Zustandsmaschine und erzeugt APERAK-ähnliche Antworten. Ein „Message Explainer"-Endpunkt übersetzt rohe EDIFACT-Nachrichten in menschenlesbare JSON-Beschreibungen. Angenommene MSCONS-Nachrichten werden verarbeitet und ihre Viertelstundenwerte je Marktlokation an den meter-data-service übergeben; Ersatz- und Vorschlagswerte behalten dabei ihren Status, nicht verwendbare Werte werden nicht übertragen. Synthetische Beispielnachrichten (u. a. ein Lastgang über die Zeitumstellung im Oktober und eine abzulehnende MSCONS) liegen in `docs/samples/`, die Architekturentscheidungen für F# und FParsec in `docs/adr/`.
