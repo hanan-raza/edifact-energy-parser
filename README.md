@@ -321,7 +321,14 @@ Coverage highlights:
 
 ## Design Decisions
 
-See `docs/adr/` for Architecture Decision Records.
+Architecture Decision Records live in [`docs/adr/`](docs/adr/):
+
+| ADR | Decision | In short |
+|-----|----------|----------|
+| [001](docs/adr/001-fsharp-for-parser.md) | F# for the parser core, C# for the API | Discriminated unions with exhaustive matching, `Result`-based error collection and structural equality fit a parser whose tests compare whole models; the API, workflow and HTTP client stay idiomatic C# behind a few adapter classes |
+| [002](docs/adr/002-fparsec-vs-manual-parser.md) | FParsec parser combinators instead of a hand-written parser | The grammars read like the message structure, errors get positions and "expected …" for free, and the delimiters from `UNA` are just data; one hot-path primitive was hand-written later for speed |
+
+Smaller decisions are documented where they apply: [docs/benchmarks.md](docs/benchmarks.md) (revised performance target and why), and the *Architecture* section above (store first, then check; failed forwarding does not reject a message; APERAK error codes).
 
 ---
 
