@@ -12,6 +12,18 @@ Content-Type: text/plain
 GET {{host}}/api/messages/{{receive.response.body.$.id}}
 Accept: application/json
 
+### Receive a load profile across the October DST switch (expects 200; 02:00 appears twice, as +02:00 and +01:00)
+POST {{host}}/api/messages
+Content-Type: text/plain
+
+< ../../docs/samples/mscons_dst_october.edi
+
+### Rejected sample file: short sender ID, negative feed-in, summer time sent as +01 (expects 422 listing all of them)
+POST {{host}}/api/messages
+Content-Type: text/plain
+
+< ../../docs/samples/mscons_rejected.edi
+
 ### Rejected message: sender is not a 13-digit market-partner ID (expects 422 with error list)
 POST {{host}}/api/messages
 Content-Type: text/plain
